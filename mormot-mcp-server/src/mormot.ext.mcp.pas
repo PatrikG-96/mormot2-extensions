@@ -58,6 +58,9 @@ const
   // error.data.uri; the 2026-07-28 revision uses JSONRPC_INVALID_PARAMS instead
   MCP_RESOURCE_NOT_FOUND = -32002;
 
+  /// default TMcpServer.PageSize: how many items one list page holds
+  MCP_DEFAULT_PAGE_SIZE = 100;
+
 type
   /// Authentication context passed to tool/resource execution
   // - provides user identity and authorization information
@@ -465,10 +468,11 @@ type
     fProcessor: TMcpJsonRpcProcessor;
     fActive: boolean;
     fSafe: TLightLock;
+    fPageSize: integer;
     function ExecuteToolCall(const aParams: variant; const aAuthCtx: TMcpAuthContext): variant;
     function ExecuteResourceRead(const aParams: variant): variant;
-    function ListTools: variant;
-    function ListResources: variant;
+    function ListTools(const aParams: variant): variant;
+    function ListResources(const aParams: variant): variant;
     function ExceptionToError(E: Exception;
       const aMessage: TMcpJsonRpcMessage): RawUtf8;
   public
@@ -497,6 +501,11 @@ type
       const aSessionId: RawUtf8 = ''): RawUtf8;
     /// check if server is active
     function IsActive: boolean;
+    /// how many items one page of tools/list or resources/list holds
+    // - MCP_DEFAULT_PAGE_SIZE by default; 0 sends all items in one page
+    // - a client gets the next page by sending back the "nextCursor" it received
+    property PageSize: integer
+      read fPageSize write fPageSize;
   end;
 
 
@@ -546,6 +555,30 @@ type
       var aSchema: TDocVariantData);
     procedure WriteType(aRtti: TRttiCustom; var aSchema: TDocVariantData);
     procedure WriteRoot(aRtti: TRttiCustom; var aSchema: TDocVariantData);
+  end;
+
+  /// one page of a list result (tools/list, resources/list, ...)
+  // - items are listed in the byte order of their unique key (name or URI)
+  // - the cursor is the base64url of {"list":..,"after":..}: the list name and
+  // the last key of the previous page, so the server keeps no state per session
+  // or per client, and a page continues correctly after items were added or
+  // removed in the meantime
+  TMcpListPage = record
+    List: RawUtf8;      // the result member, e.g. 'tools'
+    After: RawUtf8;     // the last key of the previous page
+    Continued: boolean; // true if a cursor was sent, i.e. After is set
+    Keys: TRawUtf8DynArray;     // all keys, sorted by Select
+    Indexes: TIntegerDynArray;  // the registry index of each key
+    Count: integer;     // number of Keys
+    First, Last: PtrInt; // this page is Keys[First..Last]
+    /// read the optional "cursor" param, or raise JSONRPC_INVALID_PARAMS
+    procedure Init(const aList: RawUtf8; const aParams: variant);
+    /// add the key of the registry item number Count
+    procedure Add(const aKey: RawUtf8);
+    /// sort the keys and compute First and Last; aPageSize = 0 means no limit
+    procedure Select(aPageSize: integer);
+    /// return {List: aItems} with a "nextCursor" if more items follow
+    function Done(const aItems: TDocVariantData): variant;
   end;
 
 
@@ -1544,6 +1577,76 @@ begin
 end;
 
 
+{ ************ TMcpListPage }
+
+procedure TMcpListPage.Init(const aList: RawUtf8; const aParams: variant);
+var
+  cursor: PVariant;
+  doc: TDocVariantData;
+  name: RawUtf8;
+begin
+  List := aList;
+  Continued := false;
+  Count := 0;
+  if not _Safe(aParams)^.GetAsPVariant('cursor', cursor) or
+     VarIsEmptyOrNull(cursor^) then
+    exit;
+  if VarIsString(cursor^) and
+     doc.InitJson(Base64uriToBin(VariantToUtf8(cursor^)), JSON_FAST) and
+     GetStringValue(doc, 'list', name) and
+     (name = aList) and
+     GetStringValue(doc, 'after', After) then
+  begin
+    Continued := true;
+    exit;
+  end;
+  raise EMcpException.CreateCode(JSONRPC_INVALID_PARAMS,
+    'Invalid cursor for %', [aList]);
+end;
+
+procedure TMcpListPage.Add(const aKey: RawUtf8);
+begin
+  if Count = length(Keys) then
+  begin
+    SetLength(Keys, NextGrow(Count));
+    SetLength(Indexes, length(Keys));
+  end;
+  Keys[Count] := aKey;
+  Indexes[Count] := Count;
+  inc(Count);
+end;
+
+procedure TMcpListPage.Select(aPageSize: integer);
+begin
+  QuickSortRawUtf8(Keys, Count, @Indexes); // StrComp order, as below
+  First := 0;
+  if Continued then
+    while (First < Count) and
+          (StrComp(pointer(Keys[First]), pointer(After)) <= 0) do
+      inc(First);
+  Last := Count - 1;
+  if (aPageSize > 0) and
+     (Last - First >= aPageSize) then
+    Last := First + aPageSize - 1;
+end;
+
+function TMcpListPage.Done(const aItems: TDocVariantData): variant;
+var
+  res, cursor: TDocVariantData;
+begin
+  res.InitFast;
+  res.AddValue(List, variant(aItems));
+  if Last < Count - 1 then
+  begin
+    cursor.InitFast;
+    cursor.AddValue('list', List);
+    cursor.AddValue('after', Keys[Last]);
+    res.AddValue('nextCursor', BinToBase64uri(cursor.ToJson));
+  end;
+  result := variant(res);
+end;
+
+
 { ************ TMcpServer Implementation }
 
 constructor TMcpServer.Create(const aServerName, aServerVersion: RawUtf8);
@@ -1554,6 +1657,7 @@ begin
   fTools := Collections.NewPlainKeyValue<RawUtf8, IMcpTool>;
   fResources := Collections.NewPlainKeyValue<RawUtf8, IMcpResource>;
   fActive := false;
+  fPageSize := MCP_DEFAULT_PAGE_SIZE;
 end;
 
 destructor TMcpServer.Destroy;
@@ -1641,61 +1745,61 @@ begin
   result := fActive;
 end;
 
-function TMcpServer.ListTools: variant;
+function TMcpServer.ListTools(const aParams: variant): variant;
 var
-  doc, toolsList: TDocVariantData;
-  toolObj: TDocVariantData;
-  pair: TPair<RawUtf8, IMcpTool>;
+  page: TMcpListPage;
+  tools: TDocVariantData;
+  tool: IMcpTool;
+  i: PtrInt;
 begin
-  doc.InitObject([], JSON_FAST);
-  toolsList.InitArray([], JSON_FAST);
-
+  page.Init('tools', aParams);
+  tools.InitArray([], JSON_FAST);
   fSafe.Lock;
   try
-    for pair in fTools do
+    for i := 0 to fTools.Count - 1 do
+      page.Add(fTools.Key[i]);
+    page.Select(fPageSize);
+    for i := page.First to page.Last do
     begin
-      toolObj.InitObject([
-        'name', pair.Key,
-        'description', pair.Value.GetDescription,
-        'inputSchema', pair.Value.GetInputSchema
-      ], JSON_FAST);
-      toolsList.AddItem(variant(toolObj));
+      tool := fTools.Value[page.Indexes[i]];
+      tools.AddItem(_ObjFast([
+        'name', page.Keys[i],
+        'description', tool.GetDescription,
+        'inputSchema', tool.GetInputSchema]));
     end;
   finally
     fSafe.UnLock;
   end;
-
-  doc.AddValue('tools', variant(toolsList));
-  result := variant(doc);
+  result := page.Done(tools);
 end;
 
-function TMcpServer.ListResources: variant;
+function TMcpServer.ListResources(const aParams: variant): variant;
 var
-  doc, resourcesList: TDocVariantData;
-  resourceObj: TDocVariantData;
-  pair: TPair<RawUtf8, IMcpResource>;
+  page: TMcpListPage;
+  resources: TDocVariantData;
+  resource: IMcpResource;
+  i: PtrInt;
 begin
-  doc.InitObject([], JSON_FAST);
-  resourcesList.InitArray([], JSON_FAST);
-
+  page.Init('resources', aParams);
+  resources.InitArray([], JSON_FAST);
   fSafe.Lock;
   try
-    for pair in fResources do
+    for i := 0 to fResources.Count - 1 do
+      page.Add(fResources.Key[i]);
+    page.Select(fPageSize);
+    for i := page.First to page.Last do
     begin
-      resourceObj.InitObject([
-        'uri', pair.Value.GetUri,
-        'name', pair.Value.GetName,
-        'description', pair.Value.GetDescription,
-        'mimeType', pair.Value.GetMimeType
-      ], JSON_FAST);
-      resourcesList.AddItem(variant(resourceObj));
+      resource := fResources.Value[page.Indexes[i]];
+      resources.AddItem(_ObjFast([
+        'uri', resource.GetUri,
+        'name', resource.GetName,
+        'description', resource.GetDescription,
+        'mimeType', resource.GetMimeType]));
     end;
   finally
     fSafe.UnLock;
   end;
-
-  doc.AddValue('resources', variant(resourcesList));
-  result := variant(doc);
+  result := page.Done(resources);
 end;
 
 function TMcpServer.ExecuteToolCall(const aParams: variant;
@@ -1802,11 +1906,11 @@ begin
           else if msg.Method = 'ping' then
             resultData := fProcessor.HandlePing
           else if msg.Method = 'tools/list' then
-            resultData := ListTools
+            resultData := ListTools(msg.Params)
           else if msg.Method = 'tools/call' then
             resultData := ExecuteToolCall(msg.Params, authCtx)
           else if msg.Method = 'resources/list' then
-            resultData := ListResources
+            resultData := ListResources(msg.Params)
           else if msg.Method = 'resources/read' then
             resultData := ExecuteResourceRead(msg.Params)
           else if msg.Kind = mmkNotification then
