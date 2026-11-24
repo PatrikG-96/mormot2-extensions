@@ -121,6 +121,7 @@ type
     procedure ReplaceAndRef;
     procedure SchemaCache;
     procedure ToolsList;
+    procedure ToolsCallDefaults;
   end;
 
 const
@@ -129,10 +130,12 @@ const
     '"City":{"type":"string"}},"required":["Street","City"]}';
   SCHEMA_COLOR =
     '{"type":"string","enum":["scRed","scGreen","scBlue"]}';
+  SCHEMA_PLACE_PROPS =
+    '"properties":{"Street":{"type":"string"},' +
+    '"City":{"type":"string","default":"Paris"}},"required":["Street"]';
   SCHEMA_PLACE =
-    '{"type":"object","properties":{"Street":{"type":"string"},' +
-    '"City":{"type":"string"}},"required":["Street"],' +
-    '"description":"A postal address"}';
+    '{"type":"object",' + SCHEMA_PLACE_PROPS +
+    ',"description":"A postal address"}';
   SCHEMA_SEARCH =
     '{"type":"object","properties":{' +
     '"Query":{"type":"string","description":"Text to search for",' +
@@ -140,9 +143,8 @@ const
     '"Limit":{"type":"integer","description":"Maximum number of results",' +
     '"default":10},' +
     '"Color":' + SCHEMA_COLOR + ',' +
-    '"Place":{"type":"object","properties":{"Street":{"type":"string"},' +
-    '"City":{"type":"string"}},"required":["Street"],' +
-    '"description":"Where to search"},' +
+    '"Place":{"type":"object",' + SCHEMA_PLACE_PROPS +
+    ',"description":"Where to search"},' +
     '"Code":{"type":"string","pattern":"^[A-Z]{3}$"}},' +
     '"required":["Query","Place","Code"],' +
     '"description":"Search the catalogue"}';
@@ -198,7 +200,7 @@ begin
   RegisterTypes;
   McpSchema(TypeInfo(TSchemaPlace))
     .Description('A postal address')
-    .Field('City').Optional;
+    .Field('City').DefaultValue('Paris');
   McpSchema(TypeInfo(TSchemaCode))
     .Replace('{"type":"string","pattern":"^[A-Z]{3}$"}');
   McpSchema(TypeInfo(TSchemaSearch))
@@ -404,6 +406,46 @@ begin
       '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'), JSON_FAST));
     CheckEqual(response.O['result']^.A['tools']^._[0]^.
       O['inputSchema']^.ToJson, SCHEMA_SEARCH);
+  finally
+    server.Free;
+  end;
+end;
+
+procedure TTestMcpSchema.ToolsCallDefaults;
+var
+  server: TMcpServer;
+
+  procedure CheckCall(const aArgs, aExpected: RawUtf8);
+  var
+    response: TDocVariantData;
+  begin
+    if CheckFailed(response.InitJson(server.ExecuteRequest(
+         '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":' +
+         '{"name":"search","arguments":' + aArgs + '}}'), JSON_FAST), aArgs) then
+      exit;
+    CheckEqual(response.O['result']^.A['content']^._[0]^.U['text'],
+      aExpected, aArgs);
+  end;
+
+begin
+  RegisterMetadata;
+  server := TMcpServer.Create('TestServer', '1.0');
+  try
+    server.RegisterTool(TSchemaSearchTool.Create('search', 'Search'));
+    server.Start;
+    // missing fields get their default value, also in nested records,
+    // or zero if they have none
+    CheckCall('{"Query":"x"}', '{"Query":"x","Limit":10,"Color":0,' +
+      '"Place":{"Street":"","City":"Paris"},"Code":""}');
+    CheckCall('{"Query":"x","Place":{"Street":"s"},"Code":"ABC"}',
+      '{"Query":"x","Limit":10,"Color":0,' +
+      '"Place":{"Street":"s","City":"Paris"},"Code":"ABC"}');
+    // the arguments override the default values; enumerations are read
+    // from the names published in the schema
+    CheckCall('{"Query":"y","Limit":3,"Color":"scBlue",' +
+      '"Place":{"Street":"s","City":"Lyon"}}',
+      '{"Query":"y","Limit":3,"Color":2,' +
+      '"Place":{"Street":"s","City":"Lyon"},"Code":""}');
   finally
     server.Free;
   end;

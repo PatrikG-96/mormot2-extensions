@@ -247,7 +247,9 @@ type
     fRtti: TRttiCustom;
     fFields: array of TMcpSchemaField;
     fSchema: variant;
+    fDefaults: RawUtf8;
     fVersion: integer;
+    procedure Prepare; // caller should have locked SchemaSafe
   public
     /// initialize the metadata of a type - use McpSchema() instead
     constructor CreateFrom(aRtti: TRttiCustom);
@@ -276,6 +278,11 @@ type
     // - generated on first call, then cached until any metadata changes
     // - the returned variant is shared: make a _Copy() before modifying it
     function Schema: variant;
+    /// reset a record of this type, then set the DefaultValue() of its
+    // fields, including the fields of its nested records
+    // - TMcpToolBase<T> calls it before reading the tool arguments, so that
+    // a missing argument gets its published default value, or zero
+    procedure ClearWithDefaults(var aRecord);
     /// the RTTI of this type
     property Rtti: TRttiCustom
       read fRtti;
@@ -898,23 +905,89 @@ begin
   aSchema.AddValue('$defs', variant(all));
 end;
 
-function TMcpSchemaType.Schema: variant;
+// add the DefaultValue() of the fields of aRtti, and of its nested records
+procedure AddDefaults(aRtti: TRttiCustom; var aDefaults: TDocVariantData);
+var
+  meta: TMcpSchemaType;
+  field: TMcpSchemaField;
+  nested: TDocVariantData;
+  value: PVariant;
+  p: PRttiCustomProp;
+  i: PtrInt;
+begin
+  meta := aRtti.GetPrivateSlot(TMcpSchemaType);
+  p := pointer(aRtti.Props.List);
+  for i := 1 to aRtti.Props.Count do
+  begin
+    if p^.Name <> '' then
+    begin
+      field := nil;
+      if meta <> nil then
+        field := meta.FindField(p^.Name);
+      if (field <> nil) and
+         field.fKeywords.GetAsPVariant('default', value) then
+        aDefaults.AddValue(p^.Name, value^)
+      else if p^.Value.Parser = ptRecord then
+      begin
+        nested.InitFast(dvObject);
+        AddDefaults(p^.Value, nested);
+        if nested.Count <> 0 then
+          aDefaults.AddValue(p^.Name, variant(nested));
+        nested.Clear;
+      end;
+    end;
+    inc(p);
+  end;
+end;
+
+procedure TMcpSchemaType.Prepare;
 var
   w: TSchemaWriter;
+  defaults: TDocVariantData;
+begin
+  if not VarIsEmptyOrNull(fSchema) and
+     (fVersion = SchemaVersion) then
+    exit;
+  VarClear(fSchema);
+  w.WriteRoot(fRtti, TDocVariantData(fSchema));
+  defaults.InitFast(dvObject);
+  if fRtti.Kind in rkRecordTypes then
+    AddDefaults(fRtti, defaults);
+  if defaults.Count = 0 then
+    fDefaults := ''
+  else
+    fDefaults := defaults.ToJson;
+  fVersion := SchemaVersion;
+end;
+
+function TMcpSchemaType.Schema: variant;
 begin
   SchemaSafe.Lock;
   try
-    if VarIsEmptyOrNull(fSchema) or
-       (fVersion <> SchemaVersion) then
-    begin
-      VarClear(fSchema);
-      w.WriteRoot(fRtti, TDocVariantData(fSchema));
-      fVersion := SchemaVersion;
-    end;
+    Prepare;
     result := fSchema;
   finally
     SchemaSafe.UnLock;
   end;
+end;
+
+procedure TMcpSchemaType.ClearWithDefaults(var aRecord);
+var
+  defaults: RawUtf8;
+begin
+  if not (fRtti.Kind in rkRecordTypes) then
+    raise EMcpException.CreateUtf8('McpSchema(%).ClearWithDefaults: ' +
+      'not a record', [fRtti.Name]);
+  fRtti.ValueFinalizeAndClear(@aRecord);
+  SchemaSafe.Lock;
+  try
+    Prepare;
+    defaults := fDefaults;
+  finally
+    SchemaSafe.UnLock;
+  end;
+  if defaults <> '' then
+    RecordLoadJson(aRecord, defaults, fRtti.Info);
 end;
 
 class function TMcpSchemaGenerator.GenerateSchema(aTypeInfo: PRttiInfo): variant;
@@ -1141,11 +1214,12 @@ var
   doc: PDocVariantData;
   json: RawUtf8;
 begin
-  // Deserialize arguments into typed record
+  // Deserialize arguments into typed record, over the default values
   if _Safe(aArgs, doc) then
     json := doc^.ToJson
   else
     json := '{}';
+  fSchema.ClearWithDefaults(params);
   RecordLoadJson(params, json, TypeInfo(T));
   
   // Execute typed implementation
