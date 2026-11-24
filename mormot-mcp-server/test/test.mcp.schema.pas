@@ -579,7 +579,21 @@ procedure TTestMcpSchema.ReplaceParsing;
 var
   schema: variant;
   ratio: PDocVariantData;
-  raised: boolean;
+
+  procedure CheckReplaceRaises(const aJson: RawUtf8);
+  var
+    raised: boolean;
+  begin
+    raised := false;
+    try
+      McpSchema(TypeInfo(TSchemaBounds)).Replace(aJson);
+    except
+      on EMcpException do
+        raised := true;
+    end;
+    Check(raised, aJson);
+  end;
+
 begin
   RegisterTypes;
   McpSchema(TypeInfo(TSchemaBounds))
@@ -588,14 +602,11 @@ begin
   ratio := _Safe(schema)^.O['properties']^.O['Ratio'];
   Check(TVarData(ratio^.Value['minimum']).VType = varDouble, 'not a string');
   CheckSame(ratio^.D['minimum'], 0.000001);
-  raised := false;
-  try
-    McpSchema(TypeInfo(TSchemaBounds)).Replace('null');
-  except
-    on EMcpException do
-      raised := true;
-  end;
-  Check(raised, 'null is not an object');
+  CheckReplaceRaises('null');
+  CheckReplaceRaises('');
+  CheckReplaceRaises('  ');
+  CheckReplaceRaises('{} garbage');
+  CheckReplaceRaises('[{}]');
 end;
 
 procedure TTestMcpSchema.SchemaCopies;

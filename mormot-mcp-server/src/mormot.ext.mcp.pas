@@ -568,9 +568,11 @@ procedure TMcpSchemaMeta.SetReplace(const aSchemaJson: RawUtf8);
 var
   schema: TDocVariantData;
 begin
-  // JSON_FAST_FLOAT: with JSON_FAST, 0.000001 would be parsed as a string
-  // - InitJson('null') returns a void object: check for '{' first
-  if (GotoNextNotSpace(pointer(aSchemaJson))^ <> '{') or
+  // InitJson alone accepts trailing text, and 'null' as a void object: check
+  // the whole input as strict JSON, which starts with '{', first
+  // - JSON_FAST_FLOAT: with JSON_FAST, 0.000001 would be parsed as a string
+  if not IsValidJson(aSchemaJson, {strict=}true) or
+     (GotoNextNotSpace(pointer(aSchemaJson))^ <> '{') or
      not schema.InitJson(aSchemaJson, JSON_FAST_FLOAT) or
      not schema.IsObject then
     raise EMcpException.CreateUtf8('%.Replace(%): not a JSON object',
