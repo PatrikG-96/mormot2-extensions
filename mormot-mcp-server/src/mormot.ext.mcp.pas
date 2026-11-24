@@ -26,6 +26,7 @@ uses
   mormot.core.os,
   mormot.core.unicode,
   mormot.core.text,
+  mormot.core.datetime,
   mormot.core.rtti,
   mormot.core.buffers,
   mormot.core.data,
@@ -106,6 +107,70 @@ type
       read fData write fData;
   end;
 
+  /// the sender or recipient of messages and data, e.g. in TMcpAnnotations
+  TMcpRole = (
+    mrUser,
+    mrAssistant);
+  /// a set of TMcpRole, e.g. TMcpAnnotations.Audience
+  TMcpRoles = set of TMcpRole;
+
+  /// optional annotations of a content block or resource
+  // - tell the client how to use or display the data
+  // - fill it with McpAnnotations(), then see TMcpResponseBuilder.Annotate
+  TMcpAnnotations = record
+    /// who the data is intended for, or [] if not set
+    Audience: TMcpRoles;
+    /// how important the data is, from 0 (entirely optional) to 1 (most
+    // important), or a negative value if not set
+    Priority: double;
+    /// when the data was last modified, in UTC, or 0 if not set
+    LastModified: TDateTime;
+    /// the "annotations" JSON object, or Unassigned if nothing is set
+    function ToVariant: variant;
+  end;
+
+  /// the background an icon is designed for
+  TMcpIconTheme = (
+    mitAny,
+    mitLight,
+    mitDark);
+
+  /// an icon which a client may display for a tool, resource, prompt or server
+  // - fill it with McpIcon()
+  TMcpIcon = record
+    /// a https: URL or a data: URI with base64 image data
+    Src: RawUtf8;
+    /// optional MIME type, if Src does not tell it
+    MimeType: RawUtf8;
+    /// optional sizes, e.g. '48x48', or 'any' for scalable formats
+    Sizes: TRawUtf8DynArray;
+    /// the background the icon is designed for
+    Theme: TMcpIconTheme;
+    /// the Icon JSON object
+    function ToVariant: variant;
+  end;
+  /// a list of icons, as published in an "icons" JSON array
+  TMcpIcons = array of TMcpIcon;
+
+/// return the annotations of a content block or resource
+// - aPriority is from 0 to 1, or negative if not set
+// - aLastModified is in UTC, or 0 if not set
+// - raise EMcpException if aPriority is greater than 1
+function McpAnnotations(aAudience: TMcpRoles; aPriority: double = -1;
+  aLastModified: TDateTime = 0): TMcpAnnotations;
+
+/// return an icon
+// - aSrc is a https: URL or a data: URI, e.g. 'data:image/png;base64,...'
+// - aSizes is a space-separated list, as the HTML "sizes" attribute,
+// e.g. '48x48 96x96' or 'any'
+// - raise EMcpException if aSrc is not a https: or data: URI
+function McpIcon(const aSrc: RawUtf8; const aMimeType: RawUtf8 = '';
+  const aSizes: RawUtf8 = ''; aTheme: TMcpIconTheme = mitAny): TMcpIcon;
+
+/// return the "icons" JSON array of some icons, as a TDocVariant
+function McpIconsToVariant(const aIcons: array of TMcpIcon): variant;
+
+type
   /// the kinds of incoming JSON-RPC message, as identified by
   // TMcpJsonRpcProcessor.ParseMessage
   // - mmkParseError: the input is not valid JSON
@@ -589,6 +654,96 @@ constructor EMcpException.CreateCode(aCode: integer; const aFormat: RawUtf8;
 begin
   CreateUtf8(aFormat, aArgs);
   fCode := aCode;
+end;
+
+
+{ ************ Shared Types }
+
+const
+  ROLE_TEXT: array[TMcpRole] of RawUtf8 = (
+    'user',
+    'assistant');
+  THEME_TEXT: array[TMcpIconTheme] of RawUtf8 = (
+    '',
+    'light',
+    'dark');
+
+function TMcpAnnotations.ToVariant: variant;
+var
+  doc, list: TDocVariantData;
+  r: TMcpRole;
+begin
+  doc.InitFast(dvObject);
+  if Audience <> [] then
+  begin
+    list.InitFast(dvArray);
+    for r := low(r) to high(r) do
+      if r in Audience then
+        list.AddItemText(ROLE_TEXT[r]);
+    doc.AddValue('audience', variant(list));
+  end;
+  if Priority >= 0 then
+    doc.AddValue('priority', Priority);
+  if LastModified <> 0 then
+    // always a date and a time, in UTC
+    doc.AddValueText('lastModified',
+      DateTimeToIso8601(LastModified, {expanded=}true) + 'Z');
+  if doc.Count = 0 then
+    VarClear(result)
+  else
+    result := variant(doc);
+end;
+
+function McpAnnotations(aAudience: TMcpRoles; aPriority: double;
+  aLastModified: TDateTime): TMcpAnnotations;
+begin
+  if aPriority > 1 then
+    raise EMcpException.CreateUtf8('McpAnnotations: priority % > 1', [aPriority]);
+  result.Audience := aAudience;
+  result.Priority := aPriority;
+  result.LastModified := aLastModified;
+end;
+
+function TMcpIcon.ToVariant: variant;
+var
+  doc, list: TDocVariantData;
+begin
+  doc.InitFast(dvObject);
+  doc.AddValueText('src', Src);
+  if MimeType <> '' then
+    doc.AddValueText('mimeType', MimeType);
+  if Sizes <> nil then
+  begin
+    list.InitArrayFrom(Sizes, JSON_FAST);
+    doc.AddValue('sizes', variant(list));
+  end;
+  if Theme <> mitAny then
+    doc.AddValueText('theme', THEME_TEXT[Theme]);
+  result := variant(doc);
+end;
+
+function McpIcon(const aSrc, aMimeType, aSizes: RawUtf8;
+  aTheme: TMcpIconTheme): TMcpIcon;
+begin
+  if not IdemPChar(pointer(aSrc), 'HTTPS://') and
+     not IdemPChar(pointer(aSrc), 'DATA:') then
+    raise EMcpException.CreateUtf8('McpIcon(%): not a https: or data: URI', [aSrc]);
+  result.Src := aSrc;
+  result.MimeType := aMimeType;
+  result.Sizes := nil;
+  CsvToRawUtf8DynArray(pointer(aSizes), result.Sizes, ' ');
+  result.Theme := aTheme;
+end;
+
+function McpIconsToVariant(const aIcons: array of TMcpIcon): variant;
+var
+  list: TDocVariantData;
+  i: PtrInt;
+begin
+  list.InitFast(dvArray);
+  for i := 0 to high(aIcons) do
+    list.AddItem(aIcons[i].ToVariant);
+  result := variant(list);
 end;
 
 

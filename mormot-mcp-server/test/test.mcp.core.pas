@@ -76,6 +76,7 @@ type
     procedure MissingParams;
     procedure ResourceNotFoundData;
     procedure ToolExceptions;
+    procedure AnnotationsAndIcons;
     procedure NotificationWhileStopped;
     procedure NotificationMethodAsRequest;
     procedure Pagination;
@@ -718,6 +719,55 @@ begin
   finally
     server.Free;
   end;
+end;
+
+procedure TTestMcpCore.AnnotationsAndIcons;
+var
+  icons: TMcpIcons;
+
+  procedure CheckRaises(const aSrc: RawUtf8);
+  begin
+    try
+      McpIcon(aSrc);
+      Check(false, aSrc);
+    except
+      on E: EMcpException do
+        Check(true);
+    end;
+  end;
+
+begin
+  // nothing set
+  Check(VarIsEmptyOrNull(McpAnnotations([]).ToVariant));
+  CheckEqual(VariantSaveJson(McpAnnotations([mrUser], 1).ToVariant),
+    '{"audience":["user"],"priority":1}');
+  // a date without a time is still a date-time
+  CheckEqual(VariantSaveJson(McpAnnotations([], -1,
+    EncodeDate(2026, 11, 24)).ToVariant), '{"lastModified":"2026-11-24T00:00:00Z"}');
+  try
+    McpAnnotations([], 1.5);
+    Check(false, 'priority > 1');
+  except
+    on E: EMcpException do
+      Check(true);
+  end;
+  // icons: only https: and data: URIs
+  SetLength(icons, 3);
+  icons[0] := McpIcon('https://example.com/icon.png', 'image/png',
+    '48x48  96x96', mitDark);
+  icons[1] := McpIcon('data:image/svg+xml;base64,PHN2Zy8+', '', 'any', mitLight);
+  icons[2] := McpIcon('HTTPS://example.com/icon');
+  CheckEqual(VariantSaveJson(McpIconsToVariant(icons)), '[' +
+    '{"src":"https://example.com/icon.png","mimeType":"image/png",' +
+      '"sizes":["48x48","96x96"],"theme":"dark"},' +
+    '{"src":"data:image/svg+xml;base64,PHN2Zy8+","sizes":["any"],' +
+      '"theme":"light"},' +
+    '{"src":"HTTPS://example.com/icon"}]');
+  CheckEqual(VariantSaveJson(McpIconsToVariant([])), '[]');
+  CheckRaises('http://example.com/icon.png');
+  CheckRaises('javascript:alert(1)');
+  CheckRaises('file:///icon.png');
+  CheckRaises('');
 end;
 
 procedure TTestMcpCore.NotificationWhileStopped;
