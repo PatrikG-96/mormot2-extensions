@@ -14,6 +14,7 @@ uses
   mormot.core.log,
   mormot.core.test,
   test.mcp.core,
+  test.mcp.schema,
   test.mcp.transports;
 
 type
@@ -26,6 +27,7 @@ procedure TMcpTests.MCP;
 begin
   AddCase([
     TTestMcpCore,
+    TTestMcpSchema,
     TTestMcpTransports,
     TTestMcpStreamableTransport
   ]);

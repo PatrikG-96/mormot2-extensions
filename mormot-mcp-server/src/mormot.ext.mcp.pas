@@ -170,11 +170,21 @@ type
 { ************ RTTI-based Schema Generation }
 
 type
-  /// Generate JSON schema from Object RTTI
-  // - generates basic schema with type, properties, and required fields
+  /// generate a JSON Schema (2020-12 dialect) from the RTTI of a type
+  // - records and classes are objects, with "properties" in the casing of
+  // their fields and all fields "required"; a record without any field (a
+  // tool without parameters) is {"type":"object","additionalProperties":false}
+  // - dynamic and static arrays have "items", enumerations an "enum" of their
+  // names, sets an array of those names, nested records their own properties
+  // - TDateTime, TTimeLog, TUnixTime and TUnixMSTime are "date-time" strings,
+  // TDate a "date" string, TGuid a "uuid" string and RawByteString a base64
+  // string: the text forms which mORMot reads from JSON
+  // - a type which refers to itself (e.g. through a dynamic array) is written
+  // once, in "$defs", then referenced with "$ref"
+  // - variant, RawJson, interfaces and custom types accept any JSON value ({})
   TMcpSchemaGenerator = class
   public
-    /// Returns a TDocVariantData with schema structure
+    /// return the JSON Schema of a type, as a TDocVariant object
     class function GenerateSchema(aTypeInfo: PRttiInfo): variant;
   end;
 
@@ -362,91 +372,199 @@ end;
 
 { ************ TMcpSchemaGenerator Implementation }
 
-class function TMcpSchemaGenerator.GenerateSchema(aTypeInfo: PRttiInfo): variant;
-var
-  rc: TRttiCustom;
-  prop: PRttiCustomProp;
-  props, schema: TDocVariantData;
-  required: TDocVariantData;
-  i: PtrInt;
-  propSchema: TDocVariantData;
-  jsonType: RawUtf8;
+type
+  /// a record or class being written, to detect recursive types
+  PSchemaFrame = ^TSchemaFrame;
+  TSchemaFrame = record
+    Rtti: TRttiCustom;
+    Parent: PSchemaFrame;
+  end;
 
-  function JsonTypeFromRtti(const aRtti: TRttiCustom): RawUtf8;
+  /// write the JSON Schema of one type from its RTTI
+  TSchemaWriter = record
+    Root: TRttiCustom;
+    Top: PSchemaFrame;
+    Defs: TPointerDynArray; // recursive types, to be written in "$defs"
+    function IsRecursive(aRtti: TRttiCustom): boolean;
+    procedure AddEnum(aRtti: TRttiCustom; var aSchema: TDocVariantData);
+    procedure WriteObject(aRtti: TRttiCustom; var aSchema: TDocVariantData);
+    procedure WriteType(aRtti: TRttiCustom; var aSchema: TDocVariantData);
+    procedure WriteRoot(aRtti: TRttiCustom; var aSchema: TDocVariantData);
+  end;
+
+function TSchemaWriter.IsRecursive(aRtti: TRttiCustom): boolean;
+var
+  f: PSchemaFrame;
+begin
+  result := true;
+  f := Top;
+  while f <> nil do
+    if f^.Rtti = aRtti then
+      exit
+    else
+      f := f^.Parent;
+  result := false;
+end;
+
+procedure TSchemaWriter.AddEnum(aRtti: TRttiCustom; var aSchema: TDocVariantData);
+var
+  names: TRawUtf8DynArray;
+  enum: TDocVariantData;
+  i: PtrInt;
+begin
+  // the names which _JL_Enumeration/_JL_Set read, i.e. GetEnumFromText()
+  if aRtti.Cache.EnumCustomText <> nil then
   begin
-    if aRtti = nil then
+    enum.InitFast(dvArray);
+    for i := aRtti.Cache.EnumMin to aRtti.Cache.EnumMax do
+      if aRtti.Cache.EnumCustomText^[i] <> '' then
+        enum.AddItemText(aRtti.Cache.EnumCustomText^[i]);
+  end
+  else
+  begin
+    aRtti.Cache.EnumInfo^.GetEnumNames(names, scNoTrim);
+    enum.InitArrayFrom(names, JSON_FAST);
+  end;
+  aSchema.AddValueText('type', 'string');
+  aSchema.AddValue('enum', variant(enum));
+end;
+
+procedure TSchemaWriter.WriteObject(aRtti: TRttiCustom;
+  var aSchema: TDocVariantData);
+var
+  frame: TSchemaFrame;
+  props, required, field: TDocVariantData;
+  p: PRttiCustomProp;
+  i: PtrInt;
+begin
+  if IsRecursive(aRtti) then
+  begin
+    if aRtti = Root then
+      aSchema.AddValueText('$ref', '#')
+    else
     begin
-      result := 'string';
-      exit;
+      PtrArrayAddOnce(Defs, aRtti);
+      aSchema.AddValueText('$ref', '#/$defs/' + aRtti.Name);
     end;
+    exit;
+  end;
+  frame.Rtti := aRtti;
+  frame.Parent := Top;
+  Top := @frame;
+  props.InitFast(dvObject);
+  required.InitFast(dvArray);
+  p := pointer(aRtti.Props.List);
+  for i := 1 to aRtti.Props.Count do
+  begin
+    if p^.Name <> '' then
+    begin
+      WriteType(p^.Value, field);
+      props.AddValue(p^.Name, variant(field));
+      field.Clear;
+      required.AddItemText(p^.Name);
+    end;
+    inc(p);
+  end;
+  aSchema.AddValueText('type', 'object');
+  if props.Count <> 0 then
+  begin
+    aSchema.AddValue('properties', variant(props));
+    aSchema.AddValue('required', variant(required));
+  end
+  else if (aRtti.Kind in rkRecordTypes) and
+          (aRtti.Size <> 0) then
+    // e.g. on FPC 3.2.2, which has no field names in its record RTTI
+    TSynLog.Add.Log(sllWarning, 'TMcpSchemaGenerator: % has no field ' +
+      'RTTI - call Rtti.RegisterFromText()', [aRtti.Name])
+  else
+    aSchema.AddValue('additionalProperties', false);
+  Top := frame.Parent;
+end;
+
+procedure TSchemaWriter.WriteType(aRtti: TRttiCustom; var aSchema: TDocVariantData);
+var
+  items: TDocVariantData;
+begin
+  aSchema.InitFast(dvObject);
+  if aRtti <> nil then
     case aRtti.Parser of
       ptBoolean:
-        result := 'boolean';
-      ptByte, ptCardinal, ptInt64, ptInteger, ptQWord, ptWord, ptOrm:
-        result := 'integer';
-      ptCurrency, ptDouble, ptExtended, ptSingle, ptDateTime, ptDateTimeMS,
-      ptUnixTime, ptUnixMSTime:
-        result := 'number';
-      ptRawByteString, ptRawJson, ptRawUtf8, ptString, ptSynUnicode,
-      ptUnicodeString, ptWideString, ptWinAnsi, ptGuid, ptHash128, ptHash256,
-      ptHash512, ptTimeLog, ptPUtf8Char, ptEnumeration:
-        result := 'string';
-      ptSet, ptArray, ptDynArray:
-        result := 'array';
-      ptRecord, ptClass, ptInterface:
-        result := 'object';
-      ptVariant, ptCustom:
-        result := 'object';
-    else
-      result := 'string';
-    end;
-  end;
+        aSchema.AddValueText('type', 'boolean');
+      ptByte, ptWord, ptCardinal, ptInteger, ptInt64, ptQWord, ptOrm:
+        aSchema.AddValueText('type', 'integer');
+      ptCurrency, ptSingle, ptDouble, ptExtended:
+        aSchema.AddValueText('type', 'number');
+      ptRawUtf8, ptString, ptSynUnicode, ptUnicodeString, ptWideString,
+      ptWinAnsi, ptPUtf8Char, ptHash128, ptHash256, ptHash512:
+        aSchema.AddValueText('type', 'string');
+      ptRawByteString:
+        aSchema.Update(['type', 'string', 'contentEncoding', 'base64']);
+      ptGuid:
+        aSchema.Update(['type', 'string', 'format', 'uuid']);
+      ptDateTime, ptDateTimeMS:
+        if aRtti.Cache.IsPureDate then
+          aSchema.Update(['type', 'string', 'format', 'date'])
+        else
+          aSchema.Update(['type', 'string', 'format', 'date-time']);
+      ptTimeLog, ptUnixTime, ptUnixMSTime:
+        // stored as integers, but read from ISO-8601 text
+        aSchema.Update(['type', 'string', 'format', 'date-time']);
+      ptEnumeration:
+        AddEnum(aRtti, aSchema);
+      ptSet:
+        begin
+          items.InitFast(dvObject);
+          AddEnum(aRtti, items);
+          aSchema.AddValueText('type', 'array');
+          aSchema.AddValue('items', variant(items));
+          aSchema.AddValue('uniqueItems', true);
+        end;
+      ptArray, ptDynArray:
+        begin
+          aSchema.AddValueText('type', 'array');
+          if aRtti.ArrayRtti <> nil then
+          begin
+            WriteType(aRtti.ArrayRtti, items);
+            aSchema.AddValue('items', variant(items));
+          end;
+          if aRtti.Parser = ptArray then
+            aSchema.Update(['minItems', aRtti.Cache.ItemCount,
+                            'maxItems', aRtti.Cache.ItemCount]);
+        end;
+      ptRecord, ptClass:
+        WriteObject(aRtti, aSchema);
+    end; // ptVariant, ptRawJson, ptInterface, ptCustom: any JSON value
+end;
+
+procedure TSchemaWriter.WriteRoot(aRtti: TRttiCustom; var aSchema: TDocVariantData);
+var
+  all, def: TDocVariantData;
+  i: PtrInt;
 begin
-  // Initialize schema structure
-  schema.InitObject(['type', 'object'], JSON_FAST);
-  props.InitObject([], JSON_FAST);
-  required.InitArray([], JSON_FAST);
-
-  // Get RTTI context for the supplied type
-  if aTypeInfo = nil then
-  begin
-    result := variant(schema);
+  Root := aRtti;
+  Top := nil;
+  Defs := nil;
+  WriteType(aRtti, aSchema);
+  if Defs = nil then
     exit;
-  end;
-  rc := Rtti.RegisterType(aTypeInfo);
-  if rc = nil then
+  all.InitFast(dvObject);
+  i := 0;
+  while i < length(Defs) do // Defs may grow during the loop
   begin
-    result := variant(schema);
-    exit;
+    WriteType(Defs[i], def);
+    all.AddValue(TRttiCustom(Defs[i]).Name, variant(def));
+    def.Clear;
+    inc(i);
   end;
+  aSchema.AddValue('$defs', variant(all));
+end;
 
-  // Iterate through properties
-  for i := 0 to rc.Props.Count - 1 do
-  begin
-    prop := @rc.Props.List[i];
-    if prop.Name = '' then
-      continue;
-
-    // Initialize property schema
-    propSchema.InitObject([], JSON_FAST);
-
-    // Determine JSON type from RTTI
-    jsonType := JsonTypeFromRtti(prop.Value);
-
-    propSchema.AddValue('type', jsonType);
-
-    // Add to properties
-    props.AddValue(LowerCaseU(prop.Name), variant(propSchema));
-
-    // All properties are required (no optional metadata available)
-    required.AddItem(LowerCaseU(prop.Name));
-  end;
-
-  schema.AddValue('properties', variant(props));
-  if required.Count > 0 then
-    schema.AddValue('required', variant(required));
-
-  result := variant(schema);
+class function TMcpSchemaGenerator.GenerateSchema(aTypeInfo: PRttiInfo): variant;
+var
+  w: TSchemaWriter;
+begin
+  VarClear(result);
+  w.WriteRoot(Rtti.RegisterType(aTypeInfo), TDocVariantData(result));
 end;
 
 

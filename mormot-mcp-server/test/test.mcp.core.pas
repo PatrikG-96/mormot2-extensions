@@ -247,10 +247,15 @@ begin
   propsVar := doc^.GetValueOrNull('properties');
   props := _Safe(propsVar);
   Check(props^.IsObject);
-  CheckEqual(DocPropType(props, 'a'), 'integer');
-  CheckEqual(DocPropType(props, 'b'), 'integer');
-  CheckEqual(DocPropType(props, 'enabled'), 'boolean');
-  CheckEqual(DocPropType(props, 'name'), 'string');
+  // the field names keep the casing of the record
+  CheckEqual(DocPropType(props, 'A'), 'integer');
+  CheckEqual(DocPropType(props, 'B'), 'integer');
+  CheckEqual(DocPropType(props, 'Enabled'), 'boolean');
+  CheckEqual(DocPropType(props, 'Name'), 'string');
+  CheckEqual(VariantSaveJson(schema), '{"type":"object","properties":' +
+    '{"A":{"type":"integer"},"B":{"type":"integer"},"Enabled":' +
+    '{"type":"boolean"},"Name":{"type":"string"}},' +
+    '"required":["A","B","Enabled","Name"]}');
 end;
 
 procedure TTestMcpCore.JsonRpcProcessor;
