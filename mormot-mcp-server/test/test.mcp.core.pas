@@ -916,6 +916,15 @@ begin
       '"params":{"cursor":"' + BinToBase64uri(
         '{"list":"tools","after":1e5}') + '"}}',
       JSONRPC_INVALID_PARAMS, '10', 'cursor');
+    // unquoted names, or an embedded NUL followed by garbage
+    CheckError(server, '{"jsonrpc":"2.0","id":11,"method":"tools/list",' +
+      '"params":{"cursor":"' + BinToBase64uri(
+        '{list:"tools",after:"a"}') + '"}}',
+      JSONRPC_INVALID_PARAMS, '11', 'cursor');
+    CheckError(server, '{"jsonrpc":"2.0","id":12,"method":"tools/list",' +
+      '"params":{"cursor":"' + BinToBase64uri(
+        '{"list":"tools","after":"a"}'#0'garbage') + '"}}',
+      JSONRPC_INVALID_PARAMS, '12', 'cursor');
     // a tools/list cursor is not a resources/list cursor
     CheckError(server, '{"jsonrpc":"2.0","id":6,"method":"resources/list",' +
       '"params":{"cursor":"' + toolsCursor + '"}}',

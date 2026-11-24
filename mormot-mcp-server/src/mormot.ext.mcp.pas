@@ -1595,8 +1595,10 @@ begin
   if VarIsString(cursor^) then
   begin
     json := Base64uriToBin(VariantToUtf8(cursor^)); // a private buffer
-    // strict parsing: numbers stay numbers, and no trailing data is allowed
-    if (doc.InitJsonInPlace(pointer(json), JSON_FAST_FLOAT, @eoj) <> nil) and
+    // strict parsing: the whole span must be valid JSON (no unquoted names,
+    // no NUL or trailing data), and numbers stay numbers
+    if IsValidJson(json, true) and
+       (doc.InitJsonInPlace(pointer(json), JSON_FAST_FLOAT, @eoj) <> nil) and
        (eoj = #0) and
        GetStringValue(doc, 'list', name) and
        (name = aList) and
