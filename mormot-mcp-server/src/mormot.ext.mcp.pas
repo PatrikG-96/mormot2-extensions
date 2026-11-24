@@ -521,6 +521,33 @@ type
 
 implementation
 
+type
+  /// a record or class being written, to detect recursive types
+  PSchemaFrame = ^TSchemaFrame;
+  TSchemaFrame = record
+    Rtti: TRttiCustom;
+    Parent: PSchemaFrame;
+  end;
+
+  /// write the JSON Schema of one type from its RTTI and McpSchema() metadata
+  // - called with SchemaSafe locked
+  TSchemaWriter = record
+    Root: TRttiCustom;
+    Top: PSchemaFrame;
+    Recursive: TPointerDynArray; // recursive types, to be written in "$defs"
+    Defs: TDocVariantData;       // all "$defs", written at the root
+    function IsRecursive(aRtti: TRttiCustom): boolean;
+    procedure AddDefs(const aDefs: variant);
+    function InitReplaced(aMeta: TMcpSchemaMeta; var aSchema: TDocVariantData): boolean;
+    procedure AddKeywords(aMeta: TMcpSchemaMeta; var aSchema: TDocVariantData);
+    procedure AddEnum(aRtti: TRttiCustom; var aSchema: TDocVariantData);
+    procedure WriteRef(aRtti: TRttiCustom; var aSchema: TDocVariantData);
+    procedure WriteObject(aRtti: TRttiCustom; aMeta: TMcpSchemaType;
+      var aSchema: TDocVariantData);
+    procedure WriteType(aRtti: TRttiCustom; var aSchema: TDocVariantData);
+    procedure WriteRoot(aRtti: TRttiCustom; var aSchema: TDocVariantData);
+  end;
+
 
 { ************ EMcpException }
 
@@ -751,33 +778,6 @@ begin
   if result = nil then
     result := rc.SetPrivateSlot(TMcpSchemaType.CreateFrom(rc));
 end;
-
-type
-  /// a record or class being written, to detect recursive types
-  PSchemaFrame = ^TSchemaFrame;
-  TSchemaFrame = record
-    Rtti: TRttiCustom;
-    Parent: PSchemaFrame;
-  end;
-
-  /// write the JSON Schema of one type from its RTTI and McpSchema() metadata
-  // - called with SchemaSafe locked
-  TSchemaWriter = record
-    Root: TRttiCustom;
-    Top: PSchemaFrame;
-    Recursive: TPointerDynArray; // recursive types, to be written in "$defs"
-    Defs: TDocVariantData;       // all "$defs", written at the root
-    function IsRecursive(aRtti: TRttiCustom): boolean;
-    procedure AddDefs(const aDefs: variant);
-    function InitReplaced(aMeta: TMcpSchemaMeta; var aSchema: TDocVariantData): boolean;
-    procedure AddKeywords(aMeta: TMcpSchemaMeta; var aSchema: TDocVariantData);
-    procedure AddEnum(aRtti: TRttiCustom; var aSchema: TDocVariantData);
-    procedure WriteRef(aRtti: TRttiCustom; var aSchema: TDocVariantData);
-    procedure WriteObject(aRtti: TRttiCustom; aMeta: TMcpSchemaType;
-      var aSchema: TDocVariantData);
-    procedure WriteType(aRtti: TRttiCustom; var aSchema: TDocVariantData);
-    procedure WriteRoot(aRtti: TRttiCustom; var aSchema: TDocVariantData);
-  end;
 
 function TSchemaWriter.IsRecursive(aRtti: TRttiCustom): boolean;
 var
