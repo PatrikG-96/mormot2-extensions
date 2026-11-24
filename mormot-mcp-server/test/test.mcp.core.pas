@@ -76,6 +76,7 @@ type
     procedure MissingParams;
     procedure ResourceNotFoundData;
     procedure ToolExceptions;
+    procedure ContentBlocks;
     procedure AnnotationsAndIcons;
     procedure NotificationWhileStopped;
     procedure NotificationMethodAsRequest;
@@ -388,59 +389,42 @@ begin
 end;
 
 procedure TTestMcpCore.ResponseBuilderTextAndFile;
+const
+  PNG: RawByteString = #$89'PNG'#13#10#$1a#10'data';
 var
   builder: TMcpResponseBuilder;
-  response: variant;
-  doc, contentDoc, itemDoc: PDocVariantData;
-  contentVar, itemVar: variant;
-  tmpFile: TFileName;
+  binFile, pngFile: TFileName;
   content: RawByteString;
-  base64: RawUtf8;
-  tmp: RawUtf8;
+  response: variant;
 begin
-  tmpFile := TemporaryFileName;
+  binFile := TemporaryFileName;
+  pngFile := binFile + '.png';
   content := 'mcp-test';
-  Check(FileFromString(content, tmpFile));
+  Check(FileFromString(content, binFile));
+  Check(FileFromString(PNG, pngFile));
   try
     builder := TMcpResponseBuilder.Create;
     try
       builder.AddText('hello');
-      builder.AddFile(StringToUtf8(tmpFile));
+      // a file which is not an image or audio: an embedded binary resource,
+      // with its name (not its server path) in the URI
+      builder.AddFile(StringToUtf8(binFile), 'my report.bin');
+      // an image file: an image block
+      builder.AddFile(StringToUtf8(pngFile));
       response := builder.Build;
     finally
       builder.Free;
     end;
-
-    doc := _Safe(response);
-    contentVar := doc^.GetValueOrNull('content');
-    contentDoc := _Safe(contentVar);
-    if CheckFailed(contentDoc^.IsArray, 'content not array') then
-      exit;
-    if CheckFailed(contentDoc^.Count >= 2, 'content count < 2') then
-      exit;
-
-    itemVar := contentDoc^.Values[0];
-    if CheckFailed(_Safe(itemVar, itemDoc), 'content[0] not object') then
-      exit;
-    Check(itemDoc^.GetAsRawUtf8('type', tmp));
-    CheckEqual(tmp, 'text');
-    Check(itemDoc^.GetAsRawUtf8('text', tmp));
-    CheckEqual(tmp, 'hello');
-
-    itemVar := contentDoc^.Values[1];
-    if CheckFailed(_Safe(itemVar, itemDoc), 'content[1] not object') then
-      exit;
-    Check(itemDoc^.GetAsRawUtf8('type', tmp));
-    CheckEqual(tmp, 'resource');
-    base64 := BinToBase64(content);
-    Check(itemDoc^.GetAsRawUtf8('data', tmp));
-    CheckEqual(tmp, base64);
-    Check(itemDoc^.GetAsRawUtf8('mimeType', tmp));
-    Check(tmp <> '');
-    Check(itemDoc^.GetAsRawUtf8('fileName', tmp));
-    Check(tmp <> '');
+    CheckEqual(VariantSaveJson(response), FormatJson('{"content":[' +
+      '{"type":"text","text":"hello"},' +
+      '{"type":"resource","resource":{"uri":?,"mimeType":?,"blob":?}},' +
+      '{"type":"image","data":?,"mimeType":"image/png"}]}', [],
+      ['file:///my%20report.bin', GetMimeContentType(content, binFile),
+       BinToBase64(content),
+       BinToBase64(PNG)]));
   finally
-    DeleteFile(tmpFile);
+    DeleteFile(binFile);
+    DeleteFile(pngFile);
   end;
 end;
 
@@ -718,6 +702,62 @@ begin
       '"params":{"name":"fail","arguments":{"name":"convert"}}}'), '');
   finally
     server.Free;
+  end;
+end;
+
+procedure TTestMcpCore.ContentBlocks;
+var
+  builder: TMcpResponseBuilder;
+  first: variant;
+begin
+  builder := TMcpResponseBuilder.Create;
+  try
+    builder.AddText('hi');
+    first := builder.Build;
+    builder
+      .AddImage('png', 'image/png')
+        .Annotate(McpAnnotations([mrUser, mrAssistant], 0.5,
+          EncodeDate(2025, 1, 12) + EncodeTime(15, 0, 58, 0)))
+      .AddAudio('wav', 'audio/wav')
+        .Annotate(McpAnnotations([], 0))
+      .AddResourceLink('file:///a.txt', 'a.txt', 'The A file', 'text/plain')
+        .Annotate(McpAnnotations([mrAssistant]))
+      .AddResourceLink('db://x', 'x')
+        .Annotate(McpAnnotations([])) // nothing set: no "annotations"
+      .AddEmbeddedText('memo://1', 'text/plain', 'memo "1"')
+      .AddEmbeddedBlob('blob://1', '', 'bin');
+    CheckEqual(VariantSaveJson(builder.Build), '{"content":[' +
+      '{"type":"text","text":"hi"},' +
+      '{"type":"image","data":"cG5n","mimeType":"image/png","annotations":' +
+        '{"audience":["user","assistant"],"priority":0.5,' +
+        '"lastModified":"2025-01-12T15:00:58Z"}},' +
+      '{"type":"audio","data":"d2F2","mimeType":"audio/wav",' +
+        '"annotations":{"priority":0}},' +
+      '{"type":"resource_link","uri":"file:///a.txt","name":"a.txt",' +
+        '"description":"The A file","mimeType":"text/plain",' +
+        '"annotations":{"audience":["assistant"]}},' +
+      '{"type":"resource_link","uri":"db://x","name":"x"},' +
+      '{"type":"resource","resource":{"uri":"memo://1","mimeType":"text/plain",' +
+        '"text":"memo \"1\""}},' +
+      '{"type":"resource","resource":{"uri":"blob://1","blob":"Ymlu"}}]}');
+    // a previous Build is not changed by the blocks added afterwards
+    CheckEqual(VariantSaveJson(first), '{"content":[{"type":"text","text":"hi"}]}');
+  finally
+    builder.Free;
+  end;
+  // Annotate needs a block
+  builder := TMcpResponseBuilder.Create;
+  try
+    try
+      builder.Annotate(McpAnnotations([mrUser]));
+      Check(false, 'Annotate without a block');
+    except
+      on E: EMcpException do
+        Check(true);
+    end;
+    CheckEqual(VariantSaveJson(builder.Build), '{"content":[]}');
+  finally
+    builder.Free;
   end;
 end;
 

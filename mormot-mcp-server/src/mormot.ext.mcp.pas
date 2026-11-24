@@ -577,17 +577,61 @@ type
 { ************ Response Builder Helper }
 
 type
-  /// Helper to build MCP tool responses with content array
+  /// Helper to build MCP tool results, i.e. a "content" array of blocks
+  // - e.g.
+  // ! builder := TMcpResponseBuilder.Create;
+  // ! try
+  // !   builder.AddText('Chart of the sales')
+  // !     .AddImage(png, 'image/png').Annotate(McpAnnotations([mrUser]));
+  // !   result := builder.Build;
+  // ! finally
+  // !   builder.Free;
+  // ! end;
   TMcpResponseBuilder = class
   private
     fContent: TDocVariantData;
+    function AddBlock(const aType: RawUtf8;
+      const aNameValuePairs: array of const): TMcpResponseBuilder;
   public
     /// initialize builder
     constructor Create;
-    /// add text content block
+    /// add a "text" content block
     function AddText(const aText: RawUtf8): TMcpResponseBuilder;
-    /// add base64-encoded file content
-    function AddFile(const aFilePath: RawUtf8; const aFileName: RawUtf8 = ''): TMcpResponseBuilder;
+    /// add an "image" content block
+    // - aData is the binary image, sent base64-encoded
+    function AddImage(const aData: RawByteString;
+      const aMimeType: RawUtf8): TMcpResponseBuilder;
+    /// add an "audio" content block
+    // - aData is the binary audio, sent base64-encoded
+    function AddAudio(const aData: RawByteString;
+      const aMimeType: RawUtf8): TMcpResponseBuilder;
+    /// add a "resource_link" content block, i.e. a resource which the client
+    // may read
+    // - the resource need not be listed by resources/list
+    function AddResourceLink(const aUri, aName: RawUtf8;
+      const aDescription: RawUtf8 = '';
+      const aMimeType: RawUtf8 = ''): TMcpResponseBuilder;
+    /// add a "resource" content block, with the text of an embedded resource
+    // - aMimeType is optional
+    function AddEmbeddedText(const aUri, aMimeType,
+      aText: RawUtf8): TMcpResponseBuilder;
+    /// add a "resource" content block, with the binary content of an
+    // embedded resource, sent base64-encoded
+    // - aMimeType is optional
+    function AddEmbeddedBlob(const aUri, aMimeType: RawUtf8;
+      const aData: RawByteString): TMcpResponseBuilder;
+    /// add the content of a file, as an "image", "audio" or else an embedded
+    // binary "resource" block, depending on its MIME type
+    // - the URI of an embedded resource is 'file:///' + the URI-encoded
+    // aFileName, or the name of aFilePath if aFileName is '': the server
+    // folder is not published
+    // - raise EMcpException if the file does not exist
+    function AddFile(const aFilePath: RawUtf8;
+      const aFileName: RawUtf8 = ''): TMcpResponseBuilder;
+    /// set the annotations of the last added block
+    // - does nothing if aAnnotations has nothing set
+    // - raise EMcpException if no block was added yet
+    function Annotate(const aAnnotations: TMcpAnnotations): TMcpResponseBuilder;
     /// build final response as variant
     function Build: variant;
   end;
@@ -2118,64 +2162,134 @@ end;
 
 { ************ TMcpResponseBuilder Implementation }
 
+// the TextResourceContents or BlobResourceContents of a resource
+// - aKind is 'text' or 'blob' (then aValue is base64-encoded)
+function ResourceContents(const aUri, aMimeType, aKind, aValue: RawUtf8): variant;
+var
+  doc: TDocVariantData;
+begin
+  doc.InitFast(dvObject);
+  doc.AddValueText('uri', aUri);
+  if aMimeType <> '' then
+    doc.AddValueText('mimeType', aMimeType);
+  doc.AddValueText(aKind, aValue);
+  result := variant(doc);
+end;
+
 constructor TMcpResponseBuilder.Create;
 begin
   inherited Create;
-  fContent.InitArray([], JSON_FAST);
+  fContent.InitFast(dvArray);
 end;
 
-function TMcpResponseBuilder.AddText(const aText: RawUtf8): TMcpResponseBuilder;
+function TMcpResponseBuilder.AddBlock(const aType: RawUtf8;
+  const aNameValuePairs: array of const): TMcpResponseBuilder;
 var
-  textItem: TDocVariantData;
+  block: TDocVariantData;
 begin
-  textItem.InitObject(['type', 'text', 'text', aText], JSON_FAST);
-  fContent.AddItem(variant(textItem));
+  block.InitFast(dvObject);
+  block.AddValueText('type', aType);
+  block.Update(aNameValuePairs);
+  fContent.AddItem(variant(block));
   result := self;
 end;
 
-function TMcpResponseBuilder.AddFile(const aFilePath, aFileName: RawUtf8): TMcpResponseBuilder;
-var
-  fileItem: variant;
-  content: RawByteString;
-  base64: RawUtf8;
-  mimeType, fileName: RawUtf8;
+function TMcpResponseBuilder.AddText(const aText: RawUtf8): TMcpResponseBuilder;
 begin
-  if not FileExists(Utf8ToString(aFilePath)) then
+  result := AddBlock('text', ['text', aText]);
+end;
+
+function TMcpResponseBuilder.AddImage(const aData: RawByteString;
+  const aMimeType: RawUtf8): TMcpResponseBuilder;
+begin
+  result := AddBlock('image', ['data', BinToBase64(aData), 'mimeType', aMimeType]);
+end;
+
+function TMcpResponseBuilder.AddAudio(const aData: RawByteString;
+  const aMimeType: RawUtf8): TMcpResponseBuilder;
+begin
+  result := AddBlock('audio', ['data', BinToBase64(aData), 'mimeType', aMimeType]);
+end;
+
+function TMcpResponseBuilder.AddResourceLink(const aUri, aName, aDescription,
+  aMimeType: RawUtf8): TMcpResponseBuilder;
+var
+  block: PDocVariantData;
+begin
+  result := AddBlock('resource_link', ['uri', aUri, 'name', aName]);
+  block := _Safe(fContent.Values[fContent.Count - 1]);
+  if aDescription <> '' then
+    block^.AddValueText('description', aDescription);
+  if aMimeType <> '' then
+    block^.AddValueText('mimeType', aMimeType);
+end;
+
+function TMcpResponseBuilder.AddEmbeddedText(const aUri, aMimeType,
+  aText: RawUtf8): TMcpResponseBuilder;
+begin
+  result := AddBlock('resource',
+    ['resource', ResourceContents(aUri, aMimeType, 'text', aText)]);
+end;
+
+function TMcpResponseBuilder.AddEmbeddedBlob(const aUri, aMimeType: RawUtf8;
+  const aData: RawByteString): TMcpResponseBuilder;
+begin
+  result := AddBlock('resource',
+    ['resource', ResourceContents(aUri, aMimeType, 'blob', BinToBase64(aData))]);
+end;
+
+function TMcpResponseBuilder.AddFile(const aFilePath,
+  aFileName: RawUtf8): TMcpResponseBuilder;
+var
+  fileName: TFileName;
+  content: RawByteString;
+  mimeType, name: RawUtf8;
+begin
+  fileName := Utf8ToString(aFilePath);
+  if not FileExists(fileName) then
     raise EMcpException.CreateUtf8('File not found: %', [aFilePath]);
-
-  content := StringFromFile(Utf8ToString(aFilePath));
-  base64 := BinToBase64(content);
-  
-  if aFileName = '' then
-    fileName := ExtractNameU(aFilePath)
+  content := StringFromFile(fileName);
+  mimeType := GetMimeContentType(content, fileName);
+  if IdemPChar(pointer(mimeType), 'IMAGE/') then
+    result := AddImage(content, mimeType)
+  else if IdemPChar(pointer(mimeType), 'AUDIO/') then
+    result := AddAudio(content, mimeType)
   else
-    fileName := aFileName;
-    
-  mimeType := GetMimeContentType(content, Utf8ToString(aFilePath));
+  begin
+    if aFileName = '' then
+      name := ExtractNameU(aFilePath)
+    else
+      name := aFileName;
+    result := AddEmbeddedBlob('file:///' + UrlEncodeName(name), mimeType, content);
+  end;
+end;
 
-  fileItem := _ObjFast([
-    'type', 'resource',
-    'mimeType', mimeType,
-    'data', base64,
-    'fileName', fileName
-  ]);
-  
-  fContent.AddItem(fileItem);
+function TMcpResponseBuilder.Annotate(
+  const aAnnotations: TMcpAnnotations): TMcpResponseBuilder;
+var
+  annotations: variant;
+begin
+  if fContent.Count = 0 then
+    raise EMcpException.Create('TMcpResponseBuilder.Annotate: no block yet');
+  annotations := aAnnotations.ToVariant;
+  if not VarIsEmptyOrNull(annotations) then
+    _Safe(fContent.Values[fContent.Count - 1])^.
+      AddOrUpdateValue('annotations', annotations);
   result := self;
 end;
 
 function TMcpResponseBuilder.Build: variant;
 var
-  contentCopy: TDocVariantData;
-  i: integer;
+  doc, content: TDocVariantData;
+  i: PtrInt;
 begin
-  SetVariantNull(result);
-
-  contentCopy.InitArray([], JSON_FAST);
+  // copy the list of blocks, so that adding blocks won't change this result
+  content.InitFast(dvArray);
   for i := 0 to fContent.Count - 1 do
-    contentCopy.AddItem(fContent.Values[i]);
-
-  _ObjAddProp('content', contentCopy, result);
+    content.AddItem(fContent.Values[i]);
+  doc.InitFast(dvObject);
+  doc.AddValue('content', variant(content));
+  result := variant(doc);
 end;
 
 
