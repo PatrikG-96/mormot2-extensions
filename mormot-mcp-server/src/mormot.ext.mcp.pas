@@ -170,6 +170,117 @@ type
 { ************ RTTI-based Schema Generation }
 
 type
+  /// JSON Schema metadata, common to TMcpSchemaType and TMcpSchemaField
+  TMcpSchemaMeta = class(TSynPersistent)
+  protected
+    fKeywords: TDocVariantData;
+    fReplace: variant;
+    procedure SetKeyword(const aName: RawUtf8; const aValue: variant);
+    procedure SetReplace(const aSchemaJson: RawUtf8);
+    // initialize aSchema from Replace() and return true, or return false
+    function InitReplaced(var aSchema: TDocVariantData): boolean;
+    procedure AddKeywords(var aSchema: TDocVariantData);
+  public
+    /// initialize the instance
+    constructor Create; override;
+  end;
+
+  TMcpSchemaType = class;
+
+  /// JSON Schema metadata of one field of a record (or property of a class)
+  // - returned by TMcpSchemaType.Field(): its methods return the same instance,
+  // and its Field() method the next field, so that calls can be chained
+  TMcpSchemaField = class(TMcpSchemaMeta)
+  protected
+    fOwner: TMcpSchemaType;
+    fName: RawUtf8;
+    fOptional: boolean;
+  public
+    /// set the "description" of this field
+    function Description(const aText: RawUtf8): TMcpSchemaField;
+    /// set any JSON Schema 2020-12 keyword of this field
+    // - e.g. Keyword('minimum', 1), Keyword('pattern', '^[a-z]+$') or
+    // Keyword('enum', _ArrFast(['asc', 'desc']))
+    // - replaces a generated keyword of the same name
+    function Keyword(const aName: RawUtf8; const aValue: variant): TMcpSchemaField;
+    /// set the "default" value of this field, and make it optional
+    // - the value is in its JSON form, e.g. an enumeration name
+    // - same as Keyword('default', aValue)
+    function DefaultValue(const aValue: variant): TMcpSchemaField;
+    /// make this field optional, i.e. not listed in "required"
+    // - by default, a field is required unless it has a default value
+    function Optional: TMcpSchemaField;
+    /// replace the generated schema of this field by a JSON object
+    // - e.g. '{"$ref":"#/$defs/Address"}', with "$defs" set by a Keyword() of
+    // the type which contains this field
+    // - the Description(), Keyword() and DefaultValue() of this field are
+    // still added to this JSON object
+    // - raise EMcpException if aSchemaJson is not a JSON object
+    function Replace(const aSchemaJson: RawUtf8): TMcpSchemaField;
+    /// return the metadata of another field of the same type
+    // - as TMcpSchemaType.Field(), to chain the calls
+    function Field(const aName: RawUtf8): TMcpSchemaField;
+    /// false if this field was made Optional or has a default value
+    function IsRequired: boolean;
+    /// the type which contains this field
+    property Owner: TMcpSchemaType
+      read fOwner;
+    /// the name of this field, as in the RTTI
+    property Name: RawUtf8
+      read fName;
+  end;
+
+  /// JSON Schema metadata of a type, and its generated schema
+  // - retrieve the single instance of a type with McpSchema(), e.g.
+  // ! McpSchema(TypeInfo(TSearchParams))
+  // !   .Description('Search the catalogue')
+  // !   .Field('Query').Description('Text to search for')
+  // !   .Field('Limit').Description('Maximum number of results').DefaultValue(10)
+  // !   .Field('Sort').Optional;
+  // - on FPC 3.2.2, call Rtti.RegisterFromText() first, so that the record
+  // has its field names
+  // - the metadata applies wherever the type is used, e.g. as a nested record
+  // - set the metadata once at startup: it is thread-safe, but any change
+  // makes all the schemas be generated again
+  TMcpSchemaType = class(TMcpSchemaMeta)
+  protected
+    fRtti: TRttiCustom;
+    fFields: array of TMcpSchemaField;
+    fSchema: variant;
+    fVersion: integer;
+  public
+    /// initialize the metadata of a type - use McpSchema() instead
+    constructor CreateFrom(aRtti: TRttiCustom);
+    /// finalize the instance and its fields metadata
+    destructor Destroy; override;
+    /// set the "description" of this type
+    // - a field of this type may override it with its own description
+    function Description(const aText: RawUtf8): TMcpSchemaType;
+    /// set any JSON Schema 2020-12 keyword of this type
+    // - e.g. Keyword('title', 'Search'), or Keyword('$defs', ...) for the
+    // "$ref" of a TMcpSchemaField.Replace()
+    // - replaces a generated keyword of the same name
+    function Keyword(const aName: RawUtf8; const aValue: variant): TMcpSchemaType;
+    /// replace the generated schema of this type by a JSON object
+    // - e.g. for a type with a custom JSON serializer
+    // - the Description() and Keyword() of this type are still added
+    // - raise EMcpException if aSchemaJson is not a JSON object
+    function Replace(const aSchemaJson: RawUtf8): TMcpSchemaType;
+    /// return the metadata of a field of this record or class
+    // - the field name is case-insensitive
+    // - raise EMcpException if the type has no such field in its RTTI
+    function Field(const aName: RawUtf8): TMcpSchemaField;
+    /// return the metadata of a field, or nil if none was set
+    function FindField(const aName: RawUtf8): TMcpSchemaField;
+    /// the JSON Schema of this type, as a TDocVariant object
+    // - generated on first call, then cached until any metadata changes
+    // - the returned variant is shared: make a _Copy() before modifying it
+    function Schema: variant;
+    /// the RTTI of this type
+    property Rtti: TRttiCustom
+      read fRtti;
+  end;
+
   /// generate a JSON Schema (2020-12 dialect) from the RTTI of a type
   // - records and classes are objects, with "properties" in the casing of
   // their fields and all fields "required"; a record without any field (a
@@ -182,11 +293,20 @@ type
   // - a type which refers to itself (e.g. through a dynamic array) is written
   // once, in "$defs", then referenced with "$ref"
   // - variant, RawJson, interfaces and custom types accept any JSON value ({})
+  // - descriptions, optional fields, default values and any other keyword
+  // come from the McpSchema() metadata of each type
   TMcpSchemaGenerator = class
   public
     /// return the JSON Schema of a type, as a TDocVariant object
+    // - same as McpSchema(aTypeInfo).Schema: generated once, then cached
+    // - the returned variant is shared: make a _Copy() before modifying it
     class function GenerateSchema(aTypeInfo: PRttiInfo): variant;
   end;
+
+/// return the JSON Schema metadata of a type, to describe it and its fields
+// - there is a single instance per type, owned by its TRttiCustom
+// - raise EMcpException if aTypeInfo is nil
+function McpSchema(aTypeInfo: PRttiInfo): TMcpSchemaType;
 
 
 { ************ JSON-RPC 2.0 Protocol Processor }
@@ -248,11 +368,13 @@ type
 type
   /// Generic base class for strongly-typed MCP tools
   // - T is the input parameters record type
-  // - automatically generates JSON schema from T's RTTI
+  // - its inputSchema is generated from T's RTTI and McpSchema(TypeInfo(T))
+  // metadata, see TMcpSchemaGenerator
   TMcpToolBase<T: record> = class(TInterfacedObject, IMcpTool)
   protected
     fName: RawUtf8;
     fDescription: RawUtf8;
+    fSchema: TMcpSchemaType;
     /// override this to implement tool logic
     function ExecuteTyped(const aParams: T; const aAuthCtx: TMcpAuthContext): variant; virtual; abstract;
   public
@@ -372,6 +494,194 @@ end;
 
 { ************ TMcpSchemaGenerator Implementation }
 
+var
+  // protects all TMcpSchemaMeta instances and the cached schemas
+  SchemaSafe: TLightLock;
+  // incremented on each metadata change, to generate the schemas again
+  SchemaVersion: integer;
+
+{ TMcpSchemaMeta }
+
+constructor TMcpSchemaMeta.Create;
+begin
+  inherited Create;
+  fKeywords.InitFast(dvObject);
+end;
+
+procedure TMcpSchemaMeta.SetKeyword(const aName: RawUtf8; const aValue: variant);
+begin
+  SchemaSafe.Lock;
+  try
+    fKeywords.AddOrUpdateValue(aName, aValue);
+    inc(SchemaVersion);
+  finally
+    SchemaSafe.UnLock;
+  end;
+end;
+
+procedure TMcpSchemaMeta.SetReplace(const aSchemaJson: RawUtf8);
+var
+  schema: variant;
+begin
+  schema := _JsonFast(aSchemaJson);
+  if not _Safe(schema)^.IsObject then
+    raise EMcpException.CreateUtf8('%.Replace(%): not a JSON object',
+      [self, aSchemaJson]);
+  SchemaSafe.Lock;
+  try
+    fReplace := schema;
+    inc(SchemaVersion);
+  finally
+    SchemaSafe.UnLock;
+  end;
+end;
+
+function TMcpSchemaMeta.InitReplaced(var aSchema: TDocVariantData): boolean;
+begin
+  result := not VarIsEmptyOrNull(fReplace);
+  if result then
+    aSchema.InitCopy(fReplace, JSON_FAST); // never modify fReplace itself
+end;
+
+procedure TMcpSchemaMeta.AddKeywords(var aSchema: TDocVariantData);
+var
+  i: PtrInt;
+begin
+  for i := 0 to fKeywords.Count - 1 do
+    aSchema.AddOrUpdateValue(fKeywords.Names[i], fKeywords.Values[i]);
+end;
+
+{ TMcpSchemaField }
+
+function TMcpSchemaField.Description(const aText: RawUtf8): TMcpSchemaField;
+begin
+  SetKeyword('description', RawUtf8ToVariant(aText));
+  result := self;
+end;
+
+function TMcpSchemaField.Keyword(const aName: RawUtf8;
+  const aValue: variant): TMcpSchemaField;
+begin
+  SetKeyword(aName, aValue);
+  result := self;
+end;
+
+function TMcpSchemaField.DefaultValue(const aValue: variant): TMcpSchemaField;
+begin
+  SetKeyword('default', aValue);
+  result := self;
+end;
+
+function TMcpSchemaField.Optional: TMcpSchemaField;
+begin
+  SchemaSafe.Lock;
+  try
+    fOptional := true;
+    inc(SchemaVersion);
+  finally
+    SchemaSafe.UnLock;
+  end;
+  result := self;
+end;
+
+function TMcpSchemaField.Replace(const aSchemaJson: RawUtf8): TMcpSchemaField;
+begin
+  SetReplace(aSchemaJson);
+  result := self;
+end;
+
+function TMcpSchemaField.Field(const aName: RawUtf8): TMcpSchemaField;
+begin
+  result := fOwner.Field(aName);
+end;
+
+function TMcpSchemaField.IsRequired: boolean;
+begin
+  result := not fOptional and
+            not fKeywords.Exists('default');
+end;
+
+{ TMcpSchemaType }
+
+constructor TMcpSchemaType.CreateFrom(aRtti: TRttiCustom);
+begin
+  Create;
+  fRtti := aRtti;
+end;
+
+destructor TMcpSchemaType.Destroy;
+begin
+  ObjArrayClear(fFields);
+  inherited Destroy;
+end;
+
+function TMcpSchemaType.Description(const aText: RawUtf8): TMcpSchemaType;
+begin
+  SetKeyword('description', RawUtf8ToVariant(aText));
+  result := self;
+end;
+
+function TMcpSchemaType.Keyword(const aName: RawUtf8;
+  const aValue: variant): TMcpSchemaType;
+begin
+  SetKeyword(aName, aValue);
+  result := self;
+end;
+
+function TMcpSchemaType.Replace(const aSchemaJson: RawUtf8): TMcpSchemaType;
+begin
+  SetReplace(aSchemaJson);
+  result := self;
+end;
+
+function TMcpSchemaType.FindField(const aName: RawUtf8): TMcpSchemaField;
+var
+  i: PtrInt;
+begin
+  for i := 0 to length(fFields) - 1 do
+  begin
+    result := fFields[i];
+    if IdemPropNameU(result.fName, aName) then
+      exit;
+  end;
+  result := nil;
+end;
+
+function TMcpSchemaType.Field(const aName: RawUtf8): TMcpSchemaField;
+var
+  p: PRttiCustomProp;
+begin
+  p := fRtti.Props.Find(aName);
+  if p = nil then
+    raise EMcpException.CreateUtf8('McpSchema(%).Field(%): unknown field ' +
+      '(on FPC, call Rtti.RegisterFromText first)', [fRtti.Name, aName]);
+  SchemaSafe.Lock;
+  try
+    result := FindField(p^.Name);
+    if result = nil then
+    begin
+      result := TMcpSchemaField.Create;
+      result.fOwner := self;
+      result.fName := p^.Name;
+      ObjArrayAdd(fFields, result);
+    end;
+  finally
+    SchemaSafe.UnLock;
+  end;
+end;
+
+function McpSchema(aTypeInfo: PRttiInfo): TMcpSchemaType;
+var
+  rc: TRttiCustom;
+begin
+  rc := Rtti.RegisterType(aTypeInfo);
+  if rc = nil then
+    raise EMcpException.Create('McpSchema(nil)');
+  result := rc.GetPrivateSlot(TMcpSchemaType);
+  if result = nil then
+    result := rc.SetPrivateSlot(TMcpSchemaType.CreateFrom(rc));
+end;
+
 type
   /// a record or class being written, to detect recursive types
   PSchemaFrame = ^TSchemaFrame;
@@ -380,14 +690,16 @@ type
     Parent: PSchemaFrame;
   end;
 
-  /// write the JSON Schema of one type from its RTTI
+  /// write the JSON Schema of one type from its RTTI and McpSchema() metadata
   TSchemaWriter = record
     Root: TRttiCustom;
     Top: PSchemaFrame;
     Defs: TPointerDynArray; // recursive types, to be written in "$defs"
     function IsRecursive(aRtti: TRttiCustom): boolean;
     procedure AddEnum(aRtti: TRttiCustom; var aSchema: TDocVariantData);
-    procedure WriteObject(aRtti: TRttiCustom; var aSchema: TDocVariantData);
+    procedure WriteRef(aRtti: TRttiCustom; var aSchema: TDocVariantData);
+    procedure WriteObject(aRtti: TRttiCustom; aMeta: TMcpSchemaType;
+      var aSchema: TDocVariantData);
     procedure WriteType(aRtti: TRttiCustom; var aSchema: TDocVariantData);
     procedure WriteRoot(aRtti: TRttiCustom; var aSchema: TDocVariantData);
   end;
@@ -429,25 +741,26 @@ begin
   aSchema.AddValue('enum', variant(enum));
 end;
 
-procedure TSchemaWriter.WriteObject(aRtti: TRttiCustom;
+procedure TSchemaWriter.WriteRef(aRtti: TRttiCustom; var aSchema: TDocVariantData);
+begin
+  if aRtti = Root then
+    aSchema.AddValueText('$ref', '#')
+  else
+  begin
+    PtrArrayAddOnce(Defs, aRtti);
+    aSchema.AddValueText('$ref', '#/$defs/' + aRtti.Name);
+  end;
+end;
+
+procedure TSchemaWriter.WriteObject(aRtti: TRttiCustom; aMeta: TMcpSchemaType;
   var aSchema: TDocVariantData);
 var
   frame: TSchemaFrame;
-  props, required, field: TDocVariantData;
+  props, required, schema: TDocVariantData;
+  field: TMcpSchemaField;
   p: PRttiCustomProp;
   i: PtrInt;
 begin
-  if IsRecursive(aRtti) then
-  begin
-    if aRtti = Root then
-      aSchema.AddValueText('$ref', '#')
-    else
-    begin
-      PtrArrayAddOnce(Defs, aRtti);
-      aSchema.AddValueText('$ref', '#/$defs/' + aRtti.Name);
-    end;
-    exit;
-  end;
   frame.Rtti := aRtti;
   frame.Parent := Top;
   Top := @frame;
@@ -458,10 +771,19 @@ begin
   begin
     if p^.Name <> '' then
     begin
-      WriteType(p^.Value, field);
-      props.AddValue(p^.Name, variant(field));
-      field.Clear;
-      required.AddItemText(p^.Name);
+      field := nil;
+      if aMeta <> nil then
+        field := aMeta.FindField(p^.Name);
+      if (field = nil) or
+         not field.InitReplaced(schema) then
+        WriteType(p^.Value, schema);
+      if field <> nil then
+        field.AddKeywords(schema);
+      props.AddValue(p^.Name, variant(schema));
+      schema.Clear;
+      if (field = nil) or
+         field.IsRequired then
+        required.AddItemText(p^.Name);
     end;
     inc(p);
   end;
@@ -469,7 +791,8 @@ begin
   if props.Count <> 0 then
   begin
     aSchema.AddValue('properties', variant(props));
-    aSchema.AddValue('required', variant(required));
+    if required.Count <> 0 then
+      aSchema.AddValue('required', variant(required));
   end
   else if (aRtti.Kind in rkRecordTypes) and
           (aRtti.Size <> 0) then
@@ -483,57 +806,73 @@ end;
 
 procedure TSchemaWriter.WriteType(aRtti: TRttiCustom; var aSchema: TDocVariantData);
 var
+  meta: TMcpSchemaType;
   items: TDocVariantData;
 begin
-  aSchema.InitFast(dvObject);
+  meta := nil;
   if aRtti <> nil then
-    case aRtti.Parser of
-      ptBoolean:
-        aSchema.AddValueText('type', 'boolean');
-      ptByte, ptWord, ptCardinal, ptInteger, ptInt64, ptQWord, ptOrm:
-        aSchema.AddValueText('type', 'integer');
-      ptCurrency, ptSingle, ptDouble, ptExtended:
-        aSchema.AddValueText('type', 'number');
-      ptRawUtf8, ptString, ptSynUnicode, ptUnicodeString, ptWideString,
-      ptWinAnsi, ptPUtf8Char, ptHash128, ptHash256, ptHash512:
-        aSchema.AddValueText('type', 'string');
-      ptRawByteString:
-        aSchema.Update(['type', 'string', 'contentEncoding', 'base64']);
-      ptGuid:
-        aSchema.Update(['type', 'string', 'format', 'uuid']);
-      ptDateTime, ptDateTimeMS:
-        if aRtti.Cache.IsPureDate then
-          aSchema.Update(['type', 'string', 'format', 'date'])
-        else
+    meta := aRtti.GetPrivateSlot(TMcpSchemaType);
+  if (meta = nil) or
+     not meta.InitReplaced(aSchema) then
+  begin
+    aSchema.InitFast(dvObject);
+    if aRtti <> nil then
+      case aRtti.Parser of
+        ptBoolean:
+          aSchema.AddValueText('type', 'boolean');
+        ptByte, ptWord, ptCardinal, ptInteger, ptInt64, ptQWord, ptOrm:
+          aSchema.AddValueText('type', 'integer');
+        ptCurrency, ptSingle, ptDouble, ptExtended:
+          aSchema.AddValueText('type', 'number');
+        ptRawUtf8, ptString, ptSynUnicode, ptUnicodeString, ptWideString,
+        ptWinAnsi, ptPUtf8Char, ptHash128, ptHash256, ptHash512:
+          aSchema.AddValueText('type', 'string');
+        ptRawByteString:
+          aSchema.Update(['type', 'string', 'contentEncoding', 'base64']);
+        ptGuid:
+          aSchema.Update(['type', 'string', 'format', 'uuid']);
+        ptDateTime, ptDateTimeMS:
+          if aRtti.Cache.IsPureDate then
+            aSchema.Update(['type', 'string', 'format', 'date'])
+          else
+            aSchema.Update(['type', 'string', 'format', 'date-time']);
+        ptTimeLog, ptUnixTime, ptUnixMSTime:
+          // stored as integers, but read from ISO-8601 text
           aSchema.Update(['type', 'string', 'format', 'date-time']);
-      ptTimeLog, ptUnixTime, ptUnixMSTime:
-        // stored as integers, but read from ISO-8601 text
-        aSchema.Update(['type', 'string', 'format', 'date-time']);
-      ptEnumeration:
-        AddEnum(aRtti, aSchema);
-      ptSet:
-        begin
-          items.InitFast(dvObject);
-          AddEnum(aRtti, items);
-          aSchema.AddValueText('type', 'array');
-          aSchema.AddValue('items', variant(items));
-          aSchema.AddValue('uniqueItems', true);
-        end;
-      ptArray, ptDynArray:
-        begin
-          aSchema.AddValueText('type', 'array');
-          if aRtti.ArrayRtti <> nil then
+        ptEnumeration:
+          AddEnum(aRtti, aSchema);
+        ptSet:
           begin
-            WriteType(aRtti.ArrayRtti, items);
+            items.InitFast(dvObject);
+            AddEnum(aRtti, items);
+            aSchema.AddValueText('type', 'array');
             aSchema.AddValue('items', variant(items));
+            aSchema.AddValue('uniqueItems', true);
           end;
-          if aRtti.Parser = ptArray then
-            aSchema.Update(['minItems', aRtti.Cache.ItemCount,
-                            'maxItems', aRtti.Cache.ItemCount]);
-        end;
-      ptRecord, ptClass:
-        WriteObject(aRtti, aSchema);
-    end; // ptVariant, ptRawJson, ptInterface, ptCustom: any JSON value
+        ptArray, ptDynArray:
+          begin
+            aSchema.AddValueText('type', 'array');
+            if aRtti.ArrayRtti <> nil then
+            begin
+              WriteType(aRtti.ArrayRtti, items);
+              aSchema.AddValue('items', variant(items));
+            end;
+            if aRtti.Parser = ptArray then
+              aSchema.Update(['minItems', aRtti.Cache.ItemCount,
+                              'maxItems', aRtti.Cache.ItemCount]);
+          end;
+        ptRecord, ptClass:
+          if IsRecursive(aRtti) then
+          begin
+            WriteRef(aRtti, aSchema);
+            exit; // the keywords are in the referenced schema
+          end
+          else
+            WriteObject(aRtti, meta, aSchema);
+      end; // ptVariant, ptRawJson, ptInterface, ptCustom: any JSON value
+  end;
+  if meta <> nil then
+    meta.AddKeywords(aSchema);
 end;
 
 procedure TSchemaWriter.WriteRoot(aRtti: TRttiCustom; var aSchema: TDocVariantData);
@@ -559,12 +898,28 @@ begin
   aSchema.AddValue('$defs', variant(all));
 end;
 
-class function TMcpSchemaGenerator.GenerateSchema(aTypeInfo: PRttiInfo): variant;
+function TMcpSchemaType.Schema: variant;
 var
   w: TSchemaWriter;
 begin
-  VarClear(result);
-  w.WriteRoot(Rtti.RegisterType(aTypeInfo), TDocVariantData(result));
+  SchemaSafe.Lock;
+  try
+    if VarIsEmptyOrNull(fSchema) or
+       (fVersion <> SchemaVersion) then
+    begin
+      VarClear(fSchema);
+      w.WriteRoot(fRtti, TDocVariantData(fSchema));
+      fVersion := SchemaVersion;
+    end;
+    result := fSchema;
+  finally
+    SchemaSafe.UnLock;
+  end;
+end;
+
+class function TMcpSchemaGenerator.GenerateSchema(aTypeInfo: PRttiInfo): variant;
+begin
+  result := McpSchema(aTypeInfo).Schema;
 end;
 
 
@@ -761,6 +1116,7 @@ begin
   inherited Create;
   fName := aName;
   fDescription := aDescription;
+  fSchema := McpSchema(TypeInfo(T));
 end;
 
 function TMcpToolBase<T>.GetName: RawUtf8;
@@ -774,11 +1130,8 @@ begin
 end;
 
 function TMcpToolBase<T>.GetInputSchema: variant;
-var
-  typeInfo: PRttiInfo;
 begin
-  typeInfo := System.TypeInfo(T);
-  result := TMcpSchemaGenerator.GenerateSchema(typeInfo);
+  result := fSchema.Schema;
 end;
 
 function TMcpToolBase<T>.Execute(const aArgs: variant; 

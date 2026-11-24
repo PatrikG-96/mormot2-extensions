@@ -69,17 +69,58 @@ type
     Root: TSchemaNode;
   end;
 
+  /// a type with its own schema, set with TMcpSchemaType.Replace
+  TSchemaCode = type RawUtf8;
+
+  TSchemaPlace = packed record
+    Street: RawUtf8;
+    City: RawUtf8;
+  end;
+
+  /// parameters described with McpSchema()
+  TSchemaSearch = packed record
+    Query: RawUtf8;
+    Limit: integer;
+    Color: TSchemaColor;
+    Place: TSchemaPlace;
+    Code: TSchemaCode;
+  end;
+
+  /// nested records referenced with "$ref"
+  TSchemaOrder = packed record
+    Billing: TSchemaPlace;
+    Shipping: TSchemaPlace;
+  end;
+
+  TSchemaCached = packed record
+    Value: integer;
+  end;
+
+  /// returns its parameters as JSON text
+  TSchemaSearchTool = class(TMcpToolBase<TSchemaSearch>)
+  protected
+    function ExecuteTyped(const aParams: TSchemaSearch;
+      const aAuthCtx: TMcpAuthContext): variant; override;
+  end;
+
   TTestMcpSchema = class(TSynTestCase)
   protected
     procedure CheckSchema(aInfo: PRttiInfo; const aExpected: RawUtf8);
   public
     /// register the RTTI of the test types (needed on FPC 3.2.2)
     class procedure RegisterTypes;
+    /// describe TSchemaPlace, TSchemaCode and TSchemaSearch with McpSchema()
+    class procedure RegisterMetadata;
   published
     procedure SimpleTypes;
     procedure NestedRecordsAndArrays;
     procedure NoParameters;
     procedure RecursiveTypes;
+    procedure Metadata;
+    procedure MetadataErrors;
+    procedure ReplaceAndRef;
+    procedure SchemaCache;
+    procedure ToolsList;
   end;
 
 const
@@ -88,9 +129,35 @@ const
     '"City":{"type":"string"}},"required":["Street","City"]}';
   SCHEMA_COLOR =
     '{"type":"string","enum":["scRed","scGreen","scBlue"]}';
+  SCHEMA_PLACE =
+    '{"type":"object","properties":{"Street":{"type":"string"},' +
+    '"City":{"type":"string"}},"required":["Street"],' +
+    '"description":"A postal address"}';
+  SCHEMA_SEARCH =
+    '{"type":"object","properties":{' +
+    '"Query":{"type":"string","description":"Text to search for",' +
+    '"minLength":1},' +
+    '"Limit":{"type":"integer","description":"Maximum number of results",' +
+    '"default":10},' +
+    '"Color":' + SCHEMA_COLOR + ',' +
+    '"Place":{"type":"object","properties":{"Street":{"type":"string"},' +
+    '"City":{"type":"string"}},"required":["Street"],' +
+    '"description":"Where to search"},' +
+    '"Code":{"type":"string","pattern":"^[A-Z]{3}$"}},' +
+    '"required":["Query","Place","Code"],' +
+    '"description":"Search the catalogue"}';
 
 
 implementation
+
+{ TSchemaSearchTool }
+
+function TSchemaSearchTool.ExecuteTyped(const aParams: TSchemaSearch;
+  const aAuthCtx: TMcpAuthContext): variant;
+begin
+  result := _ObjFast(['content', _ArrFast([_ObjFast(['type', 'text',
+    'text', RecordSaveJson(aParams, TypeInfo(TSchemaSearch))])])]);
+end;
 
 { TTestMcpSchema }
 
@@ -113,6 +180,33 @@ begin
       'Name:RawUtf8 Children:TSchemaNodeDynArray');
   if not RecordHasFields(TypeInfo(TSchemaTree)) then
     Rtti.RegisterFromText(TypeInfo(TSchemaTree), 'Root:TSchemaNode');
+  Rtti.RegisterType(TypeInfo(TSchemaCode));
+  if not RecordHasFields(TypeInfo(TSchemaPlace)) then
+    Rtti.RegisterFromText(TypeInfo(TSchemaPlace), 'Street,City:RawUtf8');
+  if not RecordHasFields(TypeInfo(TSchemaSearch)) then
+    Rtti.RegisterFromText(TypeInfo(TSchemaSearch), 'Query:RawUtf8 ' +
+      'Limit:integer Color:TSchemaColor Place:TSchemaPlace Code:TSchemaCode');
+  if not RecordHasFields(TypeInfo(TSchemaOrder)) then
+    Rtti.RegisterFromText(TypeInfo(TSchemaOrder),
+      'Billing,Shipping:TSchemaPlace');
+  if not RecordHasFields(TypeInfo(TSchemaCached)) then
+    Rtti.RegisterFromText(TypeInfo(TSchemaCached), 'Value:integer');
+end;
+
+class procedure TTestMcpSchema.RegisterMetadata;
+begin
+  RegisterTypes;
+  McpSchema(TypeInfo(TSchemaPlace))
+    .Description('A postal address')
+    .Field('City').Optional;
+  McpSchema(TypeInfo(TSchemaCode))
+    .Replace('{"type":"string","pattern":"^[A-Z]{3}$"}');
+  McpSchema(TypeInfo(TSchemaSearch))
+    .Description('Search the catalogue')
+    .Field('Query').Description('Text to search for').Keyword('minLength', 1)
+    .Field('Limit').Description('Maximum number of results').DefaultValue(10)
+    .Field('Color').Optional
+    .Field('Place').Description('Where to search');
 end;
 
 procedure TTestMcpSchema.CheckSchema(aInfo: PRttiInfo; const aExpected: RawUtf8);
@@ -197,6 +291,122 @@ begin
     '{"type":"object","properties":{"Root":{"type":"object",' + NODE_PROPS +
     '}},"required":["Root"],"$defs":{"TSchemaNode":{"type":"object",' +
     NODE_PROPS + '}}}');
+end;
+
+procedure TTestMcpSchema.Metadata;
+var
+  search: TMcpSchemaType;
+begin
+  RegisterMetadata;
+  CheckSchema(TypeInfo(TSchemaPlace), SCHEMA_PLACE);
+  CheckSchema(TypeInfo(TSchemaCode), '{"type":"string","pattern":"^[A-Z]{3}$"}');
+  CheckSchema(TypeInfo(TSchemaSearch), SCHEMA_SEARCH);
+  // registering the same metadata again changes nothing
+  RegisterMetadata;
+  CheckSchema(TypeInfo(TSchemaSearch), SCHEMA_SEARCH);
+  // the metadata can be read back, e.g. to validate arguments
+  search := McpSchema(TypeInfo(TSchemaSearch));
+  Check(search = McpSchema(TypeInfo(TSchemaSearch)), 'one instance per type');
+  Check(search.Rtti.Info = TypeInfo(TSchemaSearch));
+  Check(search.FindField('Code') = nil, 'no metadata');
+  if CheckFailed(search.FindField('limit') <> nil, 'case insensitive') then
+    exit;
+  CheckEqual(search.FindField('limit').Name, 'Limit');
+  Check(search.FindField('Query').IsRequired);
+  Check(not search.FindField('Limit').IsRequired, 'a default value');
+  Check(not search.FindField('Color').IsRequired, 'optional');
+  Check(search.FindField('Place').IsRequired);
+end;
+
+procedure TTestMcpSchema.MetadataErrors;
+var
+  search: TMcpSchemaType;
+  raised: boolean;
+begin
+  RegisterTypes;
+  search := McpSchema(TypeInfo(TSchemaSearch));
+  raised := false;
+  try
+    search.Field('Unknown');
+  except
+    on EMcpException do
+      raised := true;
+  end;
+  Check(raised, 'unknown field');
+  raised := false;
+  try
+    search.Field('Query').Replace('[1,2]');
+  except
+    on EMcpException do
+      raised := true;
+  end;
+  Check(raised, 'Replace() expects a JSON object');
+  raised := false;
+  try
+    McpSchema(nil);
+  except
+    on EMcpException do
+      raised := true;
+  end;
+  Check(raised, 'no type');
+end;
+
+procedure TTestMcpSchema.ReplaceAndRef;
+begin
+  RegisterMetadata;
+  // a reused nested record, defined once and referenced with "$ref"
+  McpSchema(TypeInfo(TSchemaOrder))
+    .Keyword('$defs', _ObjFast(['Place', McpSchema(TypeInfo(TSchemaPlace)).Schema]))
+    .Field('Billing').Replace('{"$ref":"#/$defs/Place"}')
+    .Field('Shipping').Replace('{"$ref":"#/$defs/Place"}')
+      .Description('Defaults to the billing address').Optional;
+  CheckSchema(TypeInfo(TSchemaOrder),
+    '{"type":"object","properties":{"Billing":{"$ref":"#/$defs/Place"},' +
+    '"Shipping":{"$ref":"#/$defs/Place",' +
+    '"description":"Defaults to the billing address"}},' +
+    '"required":["Billing"],"$defs":{"Place":' + SCHEMA_PLACE + '}}');
+end;
+
+procedure TTestMcpSchema.SchemaCache;
+const
+  BEFORE = '{"type":"object","properties":{"Value":{"type":"integer"}},' +
+    '"required":["Value"]}';
+var
+  s1, s2: variant;
+begin
+  RegisterTypes;
+  s1 := TMcpSchemaGenerator.GenerateSchema(TypeInfo(TSchemaCached));
+  s2 := TMcpSchemaGenerator.GenerateSchema(TypeInfo(TSchemaCached));
+  CheckEqual(VariantSaveJson(s1), BEFORE);
+  Check(pointer(_Safe(s1)^.Values) = pointer(_Safe(s2)^.Values),
+    'generated once');
+  // any metadata change regenerates the schemas
+  McpSchema(TypeInfo(TSchemaCached)).Field('Value').Keyword('minimum', 0);
+  s2 := TMcpSchemaGenerator.GenerateSchema(TypeInfo(TSchemaCached));
+  Check(pointer(_Safe(s1)^.Values) <> pointer(_Safe(s2)^.Values),
+    'generated again');
+  CheckEqual(VariantSaveJson(s1), BEFORE);
+  CheckEqual(VariantSaveJson(s2), '{"type":"object","properties":{"Value":' +
+    '{"type":"integer","minimum":0}},"required":["Value"]}');
+end;
+
+procedure TTestMcpSchema.ToolsList;
+var
+  server: TMcpServer;
+  response: TDocVariantData;
+begin
+  RegisterMetadata;
+  server := TMcpServer.Create('TestServer', '1.0');
+  try
+    server.RegisterTool(TSchemaSearchTool.Create('search', 'Search'));
+    server.Start;
+    Check(response.InitJson(server.ExecuteRequest(
+      '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'), JSON_FAST));
+    CheckEqual(response.O['result']^.A['tools']^._[0]^.
+      O['inputSchema']^.ToJson, SCHEMA_SEARCH);
+  finally
+    server.Free;
+  end;
 end;
 
 end.
