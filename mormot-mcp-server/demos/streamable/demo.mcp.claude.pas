@@ -182,7 +182,7 @@ begin
   builder := TMcpResponseBuilder.Create;
   try
     if TrimU(aParams.Prompt) = '' then
-      builder.AddText('{"error":"prompt is required"}')
+      builder.AddText('The prompt is required').SetError
     else
     begin
       cli := FindClaude;
@@ -201,7 +201,7 @@ begin
       end
       else
         builder.AddText(FormatUtf8('Claude CLI failed (exit %): %',
-          [exitcode, TrimU(copy(RawUtf8(output), 1, 500))]));
+          [exitcode, TrimU(copy(RawUtf8(output), 1, 500))])).SetError;
     end;
     result := builder.Build;
   finally

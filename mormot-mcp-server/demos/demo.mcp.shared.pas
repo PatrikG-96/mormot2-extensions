@@ -132,7 +132,8 @@ begin
       builder.AddText(json);
     end
     else
-      builder.AddText('{"error":"Unable to fetch public IP"}');
+      // a failure reported to the model, as an "isError" result
+      builder.AddText('Unable to fetch the public IP').SetError;
     result := builder.Build;
   finally
     builder.Free;

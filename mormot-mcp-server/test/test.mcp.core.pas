@@ -33,7 +33,8 @@ type
       const aAuthCtx: TMcpAuthContext): variant; override;
   end;
 
-  /// raises a different exception depending on the Name argument
+  /// raises a different exception, or returns a different result, depending
+  // on the Name argument
   TFailTool = class(TMcpToolBase<TCalcParams>)
   protected
     function ExecuteTyped(const aParams: TCalcParams;
@@ -61,6 +62,9 @@ type
     // - return the "name" (or "uri") members of one list page, comma separated
     function ListPage(aServer: TMcpServer; const aMethod, aCursor: RawUtf8;
       out aNextCursor: RawUtf8): RawUtf8;
+    // call the "fail" tool with aName, and check its isError result text
+    procedure CheckToolError(aServer: TMcpServer; const aName,
+      aExpectedText: RawUtf8);
   published
     procedure SchemaFromRecord;
     procedure JsonRpcProcessor;
@@ -76,6 +80,10 @@ type
     procedure MissingParams;
     procedure ResourceNotFoundData;
     procedure ToolExceptions;
+    procedure ToolErrorResults;
+    procedure InvalidToolResults;
+    procedure ContentBlocks;
+    procedure AnnotationsAndIcons;
     procedure NotificationWhileStopped;
     procedure NotificationMethodAsRequest;
     procedure Pagination;
@@ -104,14 +112,61 @@ end;
 
 function TFailTool.ExecuteTyped(const aParams: TCalcParams;
   const aAuthCtx: TMcpAuthContext): variant;
+var
+  builder: TMcpResponseBuilder;
 begin
   if aParams.Name = 'convert' then
     raise EConvertError.Create('secret /etc/passwd')
   else if aParams.Name = 'plain' then
     raise EMcpException.Create('secret plain')
   else if aParams.Name = 'coded' then
-    raise EMcpException.CreateCode(JSONRPC_INVALID_PARAMS, 'bad %', ['input']);
-  result := _ObjFast(['content', _ArrFast([])]);
+    raise EMcpException.CreateCode(JSONRPC_INVALID_PARAMS, 'bad %', ['input'])
+  else if aParams.Name = 'tool' then
+    raise EMcpToolError.CreateUtf8('No order %', [42]);
+  // the results of an unknown name are valid, the others invalid
+  if aParams.Name = 'flagged' then
+  begin
+    builder := TMcpResponseBuilder.Create;
+    try
+      result := builder.AddText('nothing found').SetError.Build;
+    finally
+      builder.Free;
+    end;
+  end
+  else if aParams.Name = 'null' then
+    result := Null
+  else if aParams.Name = 'nocontent' then
+    result := _ObjFast(['text', 'x'])
+  else if aParams.Name = 'notarray' then
+    result := _ObjFast(['content', _ObjFast(['type', 'text', 'text', 'x'])])
+  else if aParams.Name = 'notbool' then
+    result := _ObjFast(['content', _ArrFast([]), 'isError', 'yes'])
+  else if aParams.Name = 'notobject' then
+    result := _ObjFast(['content', _ArrFast(['x'])])
+  else if aParams.Name = 'notype' then
+    result := _JsonFast('{"content":[{"text":"x"}]}')
+  else if aParams.Name = 'badtype' then
+    result := _JsonFast('{"content":[{"type":"video","data":"eA=="}]}')
+  else if aParams.Name = 'badtext' then
+    result := _JsonFast('{"content":[{"type":"text","text":1}]}')
+  else if aParams.Name = 'badimage' then
+    result := _JsonFast('{"content":[{"type":"image","data":"eA=="}]}')
+  else if aParams.Name = 'badlink' then
+    result := _JsonFast('{"content":[{"type":"resource_link","uri":"a://b"}]}')
+  else if aParams.Name = 'badcase' then
+    result := _JsonFast('{"Content":[{"type":"text","text":"x"}]}')
+  else if aParams.Name = 'badcaseblock' then
+    result := _JsonFast('{"content":[{"Type":"text","Text":"x"}]}')
+  else if aParams.Name = 'badresource' then
+    result := _JsonFast('{"content":[{"type":"resource","resource":{"uri":"a://b"}}]}')
+  else
+    result := _JsonFast('{"content":[{"type":"text","text":"x"},' +
+      '{"type":"image","data":"eA==","mimeType":"image/png"},' +
+      '{"type":"audio","data":"eA==","mimeType":"audio/wav"},' +
+      '{"type":"resource_link","uri":"a://b","name":"b"},' +
+      '{"type":"resource","resource":{"uri":"a://b","text":"x"}},' +
+      '{"type":"resource","resource":{"uri":"a://b","blob":"eA=="}}],' +
+      '"isError":false}');
 end;
 
 { TVersionResource }
@@ -233,6 +288,25 @@ begin
     Check(ndx < 0, 'id must be absent')
   else if not CheckFailed(ndx >= 0, 'id missing') then
     CheckEqual(VariantSaveJson(doc.Values[ndx]), aIdJson, 'id');
+end;
+
+procedure TTestMcpCore.CheckToolError(aServer: TMcpServer;
+  const aName, aExpectedText: RawUtf8);
+var
+  response: RawUtf8;
+  doc: TDocVariantData;
+begin
+  response := aServer.ExecuteRequest(FormatJson(
+    '{"jsonrpc":"2.0","id":?,"method":"tools/call","params":' +
+    '{"name":"fail","arguments":{"name":?}}}', [], [aName, aName]));
+  if CheckFailed(doc.InitJson(response, JSON_FAST), response) then
+    exit;
+  CheckEqual(VariantSaveJson(doc.Values[doc.GetValueIndex('id')]),
+    '"' + aName + '"', 'id');
+  CheckEqual(doc.O['result']^.ToJson, FormatJson(
+    '{"content":[{"type":"text","text":?}],"isError":true}', [], [aExpectedText]),
+    aName);
+  Check(PosEx('secret', response) = 0, 'no exception message leaked');
 end;
 
 procedure TTestMcpCore.SchemaFromRecord;
@@ -387,59 +461,49 @@ begin
 end;
 
 procedure TTestMcpCore.ResponseBuilderTextAndFile;
+const
+  PNG: RawByteString = #$89'PNG'#13#10#$1a#10'data';
+  WAV: RawByteString = 'RIFF'#4#0#0#0'WAVEfmt data';
 var
   builder: TMcpResponseBuilder;
-  response: variant;
-  doc, contentDoc, itemDoc: PDocVariantData;
-  contentVar, itemVar: variant;
-  tmpFile: TFileName;
+  binFile, pngFile, wavFile: TFileName;
   content: RawByteString;
-  base64: RawUtf8;
-  tmp: RawUtf8;
+  response: variant;
 begin
-  tmpFile := TemporaryFileName;
+  binFile := TemporaryFileName;
+  pngFile := binFile + '.png';
   content := 'mcp-test';
-  Check(FileFromString(content, tmpFile));
+  Check(FileFromString(content, binFile));
+  Check(FileFromString(PNG, pngFile));
+  wavFile := binFile + '.wav';
+  Check(FileFromString(WAV, wavFile));
   try
     builder := TMcpResponseBuilder.Create;
     try
       builder.AddText('hello');
-      builder.AddFile(StringToUtf8(tmpFile));
+      // a file which is not an image or audio: an embedded binary resource,
+      // with its name (not its server path) in the URI
+      builder.AddFile(StringToUtf8(binFile), 'my report.bin');
+      // an image file: an image block
+      builder.AddFile(StringToUtf8(pngFile));
+      // a WAV file: an audio block
+      builder.AddFile(StringToUtf8(wavFile));
       response := builder.Build;
     finally
       builder.Free;
     end;
-
-    doc := _Safe(response);
-    contentVar := doc^.GetValueOrNull('content');
-    contentDoc := _Safe(contentVar);
-    if CheckFailed(contentDoc^.IsArray, 'content not array') then
-      exit;
-    if CheckFailed(contentDoc^.Count >= 2, 'content count < 2') then
-      exit;
-
-    itemVar := contentDoc^.Values[0];
-    if CheckFailed(_Safe(itemVar, itemDoc), 'content[0] not object') then
-      exit;
-    Check(itemDoc^.GetAsRawUtf8('type', tmp));
-    CheckEqual(tmp, 'text');
-    Check(itemDoc^.GetAsRawUtf8('text', tmp));
-    CheckEqual(tmp, 'hello');
-
-    itemVar := contentDoc^.Values[1];
-    if CheckFailed(_Safe(itemVar, itemDoc), 'content[1] not object') then
-      exit;
-    Check(itemDoc^.GetAsRawUtf8('type', tmp));
-    CheckEqual(tmp, 'resource');
-    base64 := BinToBase64(content);
-    Check(itemDoc^.GetAsRawUtf8('data', tmp));
-    CheckEqual(tmp, base64);
-    Check(itemDoc^.GetAsRawUtf8('mimeType', tmp));
-    Check(tmp <> '');
-    Check(itemDoc^.GetAsRawUtf8('fileName', tmp));
-    Check(tmp <> '');
+    CheckEqual(VariantSaveJson(response), FormatJson('{"content":[' +
+      '{"type":"text","text":"hello"},' +
+      '{"type":"resource","resource":{"uri":?,"mimeType":?,"blob":?}},' +
+      '{"type":"image","data":?,"mimeType":"image/png"},' +
+      '{"type":"audio","data":?,"mimeType":"audio/wav"}]}', [],
+      ['file:///my%20report.bin', GetMimeContentType(content, binFile),
+       BinToBase64(content),
+       BinToBase64(PNG), BinToBase64(WAV)]));
   finally
-    DeleteFile(tmpFile);
+    DeleteFile(binFile);
+    DeleteFile(pngFile);
+    DeleteFile(wavFile);
   end;
 end;
 
@@ -694,30 +758,203 @@ end;
 procedure TTestMcpCore.ToolExceptions;
 var
   server: TMcpServer;
-  response: RawUtf8;
 begin
   server := NewServer;
   try
-    // not an ESynException: caught, generic message, no internal details
-    response := server.ExecuteRequest('{"jsonrpc":"2.0","id":1,"method":"tools/call",' +
-      '"params":{"name":"fail","arguments":{"name":"convert"}}}');
-    CheckErrorResponse(response, JSONRPC_INTERNAL_ERROR, 'Internal error');
-    Check(PosEx('secret', response) = 0, 'no exception message leaked');
+    // not an ESynException: an isError result with a generic text, and the
+    // details only in the log
+    CheckToolError(server, 'convert', 'Tool fail failed');
     // EMcpException without a code: not meant for the client either
-    response := server.ExecuteRequest('{"jsonrpc":"2.0","id":2,"method":"tools/call",' +
-      '"params":{"name":"fail","arguments":{"name":"plain"}}}');
-    CheckErrorResponse(response, JSONRPC_INTERNAL_ERROR, 'Internal error');
-    Check(PosEx('secret', response) = 0, 'no exception message leaked');
-    // EMcpException with a code: raised on purpose, message kept
+    CheckToolError(server, 'plain', 'Tool fail failed');
+    // EMcpException with a code: a JSON-RPC error raised on purpose
     CheckError(server, '{"jsonrpc":"2.0","id":3,"method":"tools/call",' +
       '"params":{"name":"fail","arguments":{"name":"coded"}}}',
       JSONRPC_INVALID_PARAMS, '3', 'bad input');
     // a notification never gets an answer, even when it fails
     CheckEqual(server.ExecuteRequest('{"jsonrpc":"2.0","method":"tools/call",' +
       '"params":{"name":"fail","arguments":{"name":"convert"}}}'), '');
+    // protocol errors stay JSON-RPC errors
+    CheckError(server, '{"jsonrpc":"2.0","id":4,"method":"tools/call",' +
+      '"params":{"name":"nope","arguments":{}}}', JSONRPC_INVALID_PARAMS, '4',
+      'Tool not found');
   finally
     server.Free;
   end;
+end;
+
+procedure TTestMcpCore.ToolErrorResults;
+var
+  server: TMcpServer;
+  response: RawUtf8;
+begin
+  server := NewServer;
+  try
+    // EMcpToolError: raised on purpose for the model, message kept
+    CheckToolError(server, 'tool', 'No order 42');
+    // TMcpResponseBuilder.SetError: a failure without an exception
+    CheckToolError(server, 'flagged', 'nothing found');
+    // a valid result is sent as it is, with every kind of content block
+    response := server.ExecuteRequest('{"jsonrpc":"2.0","id":1,' +
+      '"method":"tools/call","params":{"name":"fail","arguments":{}}}');
+    Check(PosEx('"result":{"content":[{"type":"text"', response) > 0, response);
+    Check(PosEx('"isError":false}', response) > 0, response);
+  finally
+    server.Free;
+  end;
+end;
+
+procedure TTestMcpCore.InvalidToolResults;
+const
+  INVALID: array[0..12] of RawUtf8 = ('null', 'nocontent', 'notarray',
+    'notbool', 'notobject', 'notype', 'badtype', 'badtext', 'badimage',
+    'badlink', 'badresource', 'badcase', 'badcaseblock');
+var
+  server: TMcpServer;
+  i: PtrInt;
+begin
+  server := NewServer;
+  try
+    // a malformed tool result is a server bug: an internal error
+    for i := 0 to high(INVALID) do
+      CheckError(server, FormatJson('{"jsonrpc":"2.0","id":?,"method":' +
+        '"tools/call","params":{"name":"fail","arguments":{"name":?}}}', [],
+        [i, INVALID[i]]), JSONRPC_INTERNAL_ERROR, Int32ToUtf8(i), 'Internal error');
+  finally
+    server.Free;
+  end;
+end;
+
+procedure TTestMcpCore.ContentBlocks;
+var
+  builder: TMcpResponseBuilder;
+  first: variant;
+begin
+  builder := TMcpResponseBuilder.Create;
+  try
+    builder.AddText('hi');
+    first := builder.Build;
+    builder
+      .AddImage('png', 'image/png')
+        .Annotate(McpAnnotations([mrUser, mrAssistant], 0.5,
+          EncodeDate(2025, 1, 12) + EncodeTime(15, 0, 58, 0)))
+      .AddAudio('wav', 'audio/wav')
+        .Annotate(McpAnnotations([], 0))
+      .AddResourceLink('file:///a.txt', 'a.txt', 'The A file', 'text/plain')
+        .Annotate(McpAnnotations([mrAssistant]))
+      .AddResourceLink('db://x', 'x')
+        .Annotate(McpAnnotations([])) // nothing set: no "annotations"
+      .AddEmbeddedText('memo://1', 'text/plain', 'memo "1"')
+      .AddEmbeddedBlob('blob://1', '', 'bin');
+    CheckEqual(VariantSaveJson(builder.Build), '{"content":[' +
+      '{"type":"text","text":"hi"},' +
+      '{"type":"image","data":"cG5n","mimeType":"image/png","annotations":' +
+        '{"audience":["user","assistant"],"priority":0.5,' +
+        '"lastModified":"2025-01-12T15:00:58Z"}},' +
+      '{"type":"audio","data":"d2F2","mimeType":"audio/wav",' +
+        '"annotations":{"priority":0}},' +
+      '{"type":"resource_link","uri":"file:///a.txt","name":"a.txt",' +
+        '"description":"The A file","mimeType":"text/plain",' +
+        '"annotations":{"audience":["assistant"]}},' +
+      '{"type":"resource_link","uri":"db://x","name":"x"},' +
+      '{"type":"resource","resource":{"uri":"memo://1","mimeType":"text/plain",' +
+        '"text":"memo \"1\""}},' +
+      '{"type":"resource","resource":{"uri":"blob://1","blob":"Ymlu"}}]}');
+    // a previous Build is not changed by the blocks added afterwards
+    CheckEqual(VariantSaveJson(first), '{"content":[{"type":"text","text":"hi"}]}');
+    builder.SetError;
+    CheckEqual(VariantSaveJson(builder.Build), '{"content":[' +
+      '{"type":"text","text":"hi"},' +
+      '{"type":"image","data":"cG5n","mimeType":"image/png","annotations":' +
+        '{"audience":["user","assistant"],"priority":0.5,' +
+        '"lastModified":"2025-01-12T15:00:58Z"}},' +
+      '{"type":"audio","data":"d2F2","mimeType":"audio/wav",' +
+        '"annotations":{"priority":0}},' +
+      '{"type":"resource_link","uri":"file:///a.txt","name":"a.txt",' +
+        '"description":"The A file","mimeType":"text/plain",' +
+        '"annotations":{"audience":["assistant"]}},' +
+      '{"type":"resource_link","uri":"db://x","name":"x"},' +
+      '{"type":"resource","resource":{"uri":"memo://1","mimeType":"text/plain",' +
+        '"text":"memo \"1\""}},' +
+      '{"type":"resource","resource":{"uri":"blob://1","blob":"Ymlu"}}],' +
+      '"isError":true}');
+  finally
+    builder.Free;
+  end;
+  // Annotate after Build does not change the result already built
+  builder := TMcpResponseBuilder.Create;
+  try
+    builder.AddText('a');
+    first := builder.Build;
+    builder.Annotate(McpAnnotations([mrUser]));
+    CheckEqual(VariantSaveJson(first), '{"content":[{"type":"text","text":"a"}]}');
+    CheckEqual(VariantSaveJson(builder.Build), '{"content":[{"type":"text",' +
+      '"text":"a","annotations":{"audience":["user"]}}]}');
+  finally
+    builder.Free;
+  end;
+  // Annotate needs a block
+  builder := TMcpResponseBuilder.Create;
+  try
+    try
+      builder.Annotate(McpAnnotations([mrUser]));
+      Check(false, 'Annotate without a block');
+    except
+      on E: EMcpException do
+        Check(true);
+    end;
+    CheckEqual(VariantSaveJson(builder.Build), '{"content":[]}');
+  finally
+    builder.Free;
+  end;
+end;
+
+procedure TTestMcpCore.AnnotationsAndIcons;
+var
+  icons: TMcpIcons;
+
+  procedure CheckRaises(const aSrc: RawUtf8);
+  begin
+    try
+      McpIcon(aSrc);
+      Check(false, aSrc);
+    except
+      on E: EMcpException do
+        Check(true);
+    end;
+  end;
+
+begin
+  // nothing set
+  Check(VarIsEmptyOrNull(McpAnnotations([]).ToVariant));
+  CheckEqual(VariantSaveJson(McpAnnotations([mrUser], 1).ToVariant),
+    '{"audience":["user"],"priority":1}');
+  // a date without a time is still a date-time
+  CheckEqual(VariantSaveJson(McpAnnotations([], -1,
+    EncodeDate(2026, 11, 24)).ToVariant), '{"lastModified":"2026-11-24T00:00:00Z"}');
+  try
+    McpAnnotations([], 1.5);
+    Check(false, 'priority > 1');
+  except
+    on E: EMcpException do
+      Check(true);
+  end;
+  // icons: only https: and data: URIs
+  SetLength(icons, 3);
+  icons[0] := McpIcon('https://example.com/icon.png', 'image/png',
+    '48x48  96x96', mitDark);
+  icons[1] := McpIcon('data:image/svg+xml;base64,PHN2Zy8+', '', 'any', mitLight);
+  icons[2] := McpIcon('HTTPS://example.com/icon');
+  CheckEqual(VariantSaveJson(McpIconsToVariant(icons)), '[' +
+    '{"src":"https://example.com/icon.png","mimeType":"image/png",' +
+      '"sizes":["48x48","96x96"],"theme":"dark"},' +
+    '{"src":"data:image/svg+xml;base64,PHN2Zy8+","sizes":["any"],' +
+      '"theme":"light"},' +
+    '{"src":"HTTPS://example.com/icon"}]');
+  CheckEqual(VariantSaveJson(McpIconsToVariant([])), '[]');
+  CheckRaises('http://example.com/icon.png');
+  CheckRaises('javascript:alert(1)');
+  CheckRaises('file:///icon.png');
+  CheckRaises('');
 end;
 
 procedure TTestMcpCore.NotificationWhileStopped;
