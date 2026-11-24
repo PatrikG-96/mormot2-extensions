@@ -107,6 +107,15 @@ type
       read fData write fData;
   end;
 
+  /// raise it from a tool to report a failure to the model
+  // - e.g. EMcpToolError.CreateUtf8('No order %', [id]) or a bad input which
+  // the model can correct: its message is sent as an "isError" tool result
+  // - any other exception raised by a tool becomes a generic "Tool <name>
+  // failed" result, with its details only in the log, except an EMcpException
+  // with a Code, which is a JSON-RPC error raised on purpose
+  // - to return a failure without raising, see TMcpResponseBuilder.SetError
+  EMcpToolError = class(EMcpException);
+
   /// the sender or recipient of messages and data, e.g. in TMcpAnnotations
   TMcpRole = (
     mrUser,
@@ -215,7 +224,12 @@ type
     function GetInputSchema: variant;
     /// execute the tool with given arguments and auth context
     // - Args is a TDocVariantData containing the input parameters
-    // - returns a TDocVariantData with 'content' array field
+    // - returns a CallToolResult TDocVariantData, i.e. a 'content' array of
+    // content blocks and an optional 'isError' boolean: see TMcpResponseBuilder
+    // - a failure for the model is an 'isError' result: raise EMcpToolError or
+    // use TMcpResponseBuilder.SetError; any other exception is logged, and
+    // returned as a generic 'isError' result
+    // - an invalid result is a JSON-RPC internal error
     function Execute(const Args: variant; const AuthCtx: TMcpAuthContext): variant;
   end;
 
@@ -484,6 +498,8 @@ type
     fDescription: RawUtf8;
     fSchema: TMcpSchemaType;
     /// override this to implement tool logic
+    // - return a CallToolResult, and raise EMcpToolError for a failure which
+    // the model should see: see IMcpTool.Execute
     function ExecuteTyped(const aParams: T; const aAuthCtx: TMcpAuthContext): variant; virtual; abstract;
   public
     /// initialize with tool name and description
@@ -590,6 +606,7 @@ type
   TMcpResponseBuilder = class
   private
     fContent: TDocVariantData;
+    fIsError: boolean;
     function AddBlock(const aType: RawUtf8;
       const aNameValuePairs: array of const): TMcpResponseBuilder;
   public
@@ -632,6 +649,11 @@ type
     // - does nothing if aAnnotations has nothing set
     // - raise EMcpException if no block was added yet
     function Annotate(const aAnnotations: TMcpAnnotations): TMcpResponseBuilder;
+    /// mark the result as a tool failure, reported to the model
+    // - i.e. "isError": true: add some text explaining the failure, so that
+    // the model can correct its request
+    // - same as raising EMcpToolError, without an exception
+    function SetError: TMcpResponseBuilder;
     /// build final response as variant
     function Build: variant;
   end;
@@ -2009,14 +2031,113 @@ begin
   result := page.Done(resources);
 end;
 
+// true if aName is a JSON string member of aDoc
+function HasString(const aDoc: TDocVariantData; const aName: RawUtf8): boolean;
+var
+  v: PVariant;
+begin
+  result := aDoc.GetAsPVariant(aName, v) and
+            VarIsString(v^);
+end;
+
+// returns '' if aBlock is a valid content block, or why it is not
+function CheckContentBlock(const aBlock: variant): RawUtf8;
+var
+  block, resource: PDocVariantData;
+  typ: RawUtf8;
+begin
+  result := '';
+  if not _SafeObject(aBlock, block) then
+    result := 'not a JSON object'
+  else if not GetStringValue(block^, 'type', typ) then
+    result := 'no "type"'
+  else if typ = 'text' then
+  begin
+    if not HasString(block^, 'text') then
+      result := 'no "text"';
+  end
+  else if (typ = 'image') or
+          (typ = 'audio') then
+  begin
+    if not HasString(block^, 'data') or
+       not HasString(block^, 'mimeType') then
+      result := 'no "data" or "mimeType"';
+  end
+  else if typ = 'resource_link' then
+  begin
+    if not HasString(block^, 'uri') or
+       not HasString(block^, 'name') then
+      result := 'no "uri" or "name"';
+  end
+  else if typ = 'resource' then
+  begin
+    if not block^.GetAsObject('resource', resource) or
+       not HasString(resource^, 'uri') or
+       not (HasString(resource^, 'text') or
+            HasString(resource^, 'blob')) then
+      result := 'no "resource" with "uri" and "text" or "blob"';
+  end
+  else
+    result := 'unknown "type"';
+end;
+
+// returns '' if aResult is a valid CallToolResult, or why it is not
+function CheckToolResult(const aResult: variant): RawUtf8;
+var
+  res, content: PDocVariantData;
+  v: PVariant;
+  i: PtrInt;
+begin
+  result := '';
+  if not _SafeObject(aResult, res) then
+    result := 'not a JSON object'
+  else if not res^.GetAsDocVariant('content', content) or
+          not content^.IsArray then
+    result := 'no "content" array'
+  else if res^.GetAsPVariant('isError', v) and
+          (TVarData(v^).VType <> varBoolean) then
+    result := '"isError" is not a boolean'
+  else
+    for i := 0 to content^.Count - 1 do
+    begin
+      result := CheckContentBlock(content^.Values[i]);
+      if result <> '' then
+      begin
+        result := FormatUtf8('content[%]: %', [i, result]);
+        exit;
+      end;
+    end;
+end;
+
+// the isError result of a tool which raised an exception
+// - only an EMcpToolError has its message sent to the model: any other
+// exception may have internal details, which only go to the log
+function ToolExceptionToResult(E: Exception; const aToolName: RawUtf8): variant;
+var
+  text: RawUtf8;
+begin
+  if E is EMcpToolError then
+    text := StringToUtf8(E.Message)
+  else
+  begin
+    TSynLog.Add.Log(sllError, 'tools/call %: % raised %',
+      [aToolName, ClassNameShort(E)^, E.Message]);
+    FormatUtf8('Tool % failed', [aToolName], text);
+  end;
+  result := _ObjFast([
+    'content', _ArrFast([_ObjFast(['type', 'text', 'text', text])]),
+    'isError', true]);
+end;
+
 function TMcpServer.ExecuteToolCall(const aParams: variant;
   const aAuthCtx: TMcpAuthContext): variant;
 var
   doc: PDocVariantData;
-  toolName: RawUtf8;
+  toolName, error: RawUtf8;
   args: variant;
   tool: IMcpTool;
 begin
+  // protocol errors are JSON-RPC errors
   doc := _Safe(aParams);
   if not GetStringValue(doc^, 'name', toolName) then
     raise EMcpException.CreateCode(JSONRPC_INVALID_PARAMS,
@@ -2033,7 +2154,26 @@ begin
     fSafe.UnLock;
   end;
 
-  result := tool.Execute(args, aAuthCtx);
+  // tool execution errors are "isError" results, which the model can see
+  try
+    result := tool.Execute(args, aAuthCtx);
+  except
+    on E: Exception do
+    begin
+      if not (E is EMcpToolError) and
+         (E is EMcpException) and
+         (EMcpException(E).Code <> 0) then
+        raise; // a JSON-RPC error raised on purpose
+      result := ToolExceptionToResult(E, toolName);
+      exit;
+    end;
+  end;
+
+  // a malformed result is a server bug: an internal error, logged
+  error := CheckToolResult(result);
+  if error <> '' then
+    raise EMcpException.CreateUtf8('Tool % returned an invalid result: %',
+      [toolName, error]);
 end;
 
 function TMcpServer.ExecuteResourceRead(const aParams: variant): variant;
@@ -2278,6 +2418,12 @@ begin
   result := self;
 end;
 
+function TMcpResponseBuilder.SetError: TMcpResponseBuilder;
+begin
+  fIsError := true;
+  result := self;
+end;
+
 function TMcpResponseBuilder.Build: variant;
 var
   doc, content: TDocVariantData;
@@ -2289,6 +2435,8 @@ begin
     content.AddItem(fContent.Values[i]);
   doc.InitFast(dvObject);
   doc.AddValue('content', variant(content));
+  if fIsError then
+    doc.AddValue('isError', true);
   result := variant(doc);
 end;
 

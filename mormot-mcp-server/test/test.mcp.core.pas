@@ -33,7 +33,8 @@ type
       const aAuthCtx: TMcpAuthContext): variant; override;
   end;
 
-  /// raises a different exception depending on the Name argument
+  /// raises a different exception, or returns a different result, depending
+  // on the Name argument
   TFailTool = class(TMcpToolBase<TCalcParams>)
   protected
     function ExecuteTyped(const aParams: TCalcParams;
@@ -61,6 +62,9 @@ type
     // - return the "name" (or "uri") members of one list page, comma separated
     function ListPage(aServer: TMcpServer; const aMethod, aCursor: RawUtf8;
       out aNextCursor: RawUtf8): RawUtf8;
+    // call the "fail" tool with aName, and check its isError result text
+    procedure CheckToolError(aServer: TMcpServer; const aName,
+      aExpectedText: RawUtf8);
   published
     procedure SchemaFromRecord;
     procedure JsonRpcProcessor;
@@ -76,6 +80,8 @@ type
     procedure MissingParams;
     procedure ResourceNotFoundData;
     procedure ToolExceptions;
+    procedure ToolErrorResults;
+    procedure InvalidToolResults;
     procedure ContentBlocks;
     procedure AnnotationsAndIcons;
     procedure NotificationWhileStopped;
@@ -106,14 +112,57 @@ end;
 
 function TFailTool.ExecuteTyped(const aParams: TCalcParams;
   const aAuthCtx: TMcpAuthContext): variant;
+var
+  builder: TMcpResponseBuilder;
 begin
   if aParams.Name = 'convert' then
     raise EConvertError.Create('secret /etc/passwd')
   else if aParams.Name = 'plain' then
     raise EMcpException.Create('secret plain')
   else if aParams.Name = 'coded' then
-    raise EMcpException.CreateCode(JSONRPC_INVALID_PARAMS, 'bad %', ['input']);
-  result := _ObjFast(['content', _ArrFast([])]);
+    raise EMcpException.CreateCode(JSONRPC_INVALID_PARAMS, 'bad %', ['input'])
+  else if aParams.Name = 'tool' then
+    raise EMcpToolError.CreateUtf8('No order %', [42]);
+  // the results of an unknown name are valid, the others invalid
+  if aParams.Name = 'flagged' then
+  begin
+    builder := TMcpResponseBuilder.Create;
+    try
+      result := builder.AddText('nothing found').SetError.Build;
+    finally
+      builder.Free;
+    end;
+  end
+  else if aParams.Name = 'null' then
+    result := Null
+  else if aParams.Name = 'nocontent' then
+    result := _ObjFast(['text', 'x'])
+  else if aParams.Name = 'notarray' then
+    result := _ObjFast(['content', _ObjFast(['type', 'text', 'text', 'x'])])
+  else if aParams.Name = 'notbool' then
+    result := _ObjFast(['content', _ArrFast([]), 'isError', 'yes'])
+  else if aParams.Name = 'notobject' then
+    result := _ObjFast(['content', _ArrFast(['x'])])
+  else if aParams.Name = 'notype' then
+    result := _JsonFast('{"content":[{"text":"x"}]}')
+  else if aParams.Name = 'badtype' then
+    result := _JsonFast('{"content":[{"type":"video","data":"eA=="}]}')
+  else if aParams.Name = 'badtext' then
+    result := _JsonFast('{"content":[{"type":"text","text":1}]}')
+  else if aParams.Name = 'badimage' then
+    result := _JsonFast('{"content":[{"type":"image","data":"eA=="}]}')
+  else if aParams.Name = 'badlink' then
+    result := _JsonFast('{"content":[{"type":"resource_link","uri":"a://b"}]}')
+  else if aParams.Name = 'badresource' then
+    result := _JsonFast('{"content":[{"type":"resource","resource":{"uri":"a://b"}}]}')
+  else
+    result := _JsonFast('{"content":[{"type":"text","text":"x"},' +
+      '{"type":"image","data":"eA==","mimeType":"image/png"},' +
+      '{"type":"audio","data":"eA==","mimeType":"audio/wav"},' +
+      '{"type":"resource_link","uri":"a://b","name":"b"},' +
+      '{"type":"resource","resource":{"uri":"a://b","text":"x"}},' +
+      '{"type":"resource","resource":{"uri":"a://b","blob":"eA=="}}],' +
+      '"isError":false}');
 end;
 
 { TVersionResource }
@@ -235,6 +284,25 @@ begin
     Check(ndx < 0, 'id must be absent')
   else if not CheckFailed(ndx >= 0, 'id missing') then
     CheckEqual(VariantSaveJson(doc.Values[ndx]), aIdJson, 'id');
+end;
+
+procedure TTestMcpCore.CheckToolError(aServer: TMcpServer;
+  const aName, aExpectedText: RawUtf8);
+var
+  response: RawUtf8;
+  doc: TDocVariantData;
+begin
+  response := aServer.ExecuteRequest(FormatJson(
+    '{"jsonrpc":"2.0","id":?,"method":"tools/call","params":' +
+    '{"name":"fail","arguments":{"name":?}}}', [], [aName, aName]));
+  if CheckFailed(doc.InitJson(response, JSON_FAST), response) then
+    exit;
+  CheckEqual(VariantSaveJson(doc.Values[doc.GetValueIndex('id')]),
+    '"' + aName + '"', 'id');
+  CheckEqual(doc.O['result']^.ToJson, FormatJson(
+    '{"content":[{"type":"text","text":?}],"isError":true}', [], [aExpectedText]),
+    aName);
+  Check(PosEx('secret', response) = 0, 'no exception message leaked');
 end;
 
 procedure TTestMcpCore.SchemaFromRecord;
@@ -679,27 +747,67 @@ end;
 procedure TTestMcpCore.ToolExceptions;
 var
   server: TMcpServer;
-  response: RawUtf8;
 begin
   server := NewServer;
   try
-    // not an ESynException: caught, generic message, no internal details
-    response := server.ExecuteRequest('{"jsonrpc":"2.0","id":1,"method":"tools/call",' +
-      '"params":{"name":"fail","arguments":{"name":"convert"}}}');
-    CheckErrorResponse(response, JSONRPC_INTERNAL_ERROR, 'Internal error');
-    Check(PosEx('secret', response) = 0, 'no exception message leaked');
+    // not an ESynException: an isError result with a generic text, and the
+    // details only in the log
+    CheckToolError(server, 'convert', 'Tool fail failed');
     // EMcpException without a code: not meant for the client either
-    response := server.ExecuteRequest('{"jsonrpc":"2.0","id":2,"method":"tools/call",' +
-      '"params":{"name":"fail","arguments":{"name":"plain"}}}');
-    CheckErrorResponse(response, JSONRPC_INTERNAL_ERROR, 'Internal error');
-    Check(PosEx('secret', response) = 0, 'no exception message leaked');
-    // EMcpException with a code: raised on purpose, message kept
+    CheckToolError(server, 'plain', 'Tool fail failed');
+    // EMcpException with a code: a JSON-RPC error raised on purpose
     CheckError(server, '{"jsonrpc":"2.0","id":3,"method":"tools/call",' +
       '"params":{"name":"fail","arguments":{"name":"coded"}}}',
       JSONRPC_INVALID_PARAMS, '3', 'bad input');
     // a notification never gets an answer, even when it fails
     CheckEqual(server.ExecuteRequest('{"jsonrpc":"2.0","method":"tools/call",' +
       '"params":{"name":"fail","arguments":{"name":"convert"}}}'), '');
+    // protocol errors stay JSON-RPC errors
+    CheckError(server, '{"jsonrpc":"2.0","id":4,"method":"tools/call",' +
+      '"params":{"name":"nope","arguments":{}}}', JSONRPC_INVALID_PARAMS, '4',
+      'Tool not found');
+  finally
+    server.Free;
+  end;
+end;
+
+procedure TTestMcpCore.ToolErrorResults;
+var
+  server: TMcpServer;
+  response: RawUtf8;
+begin
+  server := NewServer;
+  try
+    // EMcpToolError: raised on purpose for the model, message kept
+    CheckToolError(server, 'tool', 'No order 42');
+    // TMcpResponseBuilder.SetError: a failure without an exception
+    CheckToolError(server, 'flagged', 'nothing found');
+    // a valid result is sent as it is, with every kind of content block
+    response := server.ExecuteRequest('{"jsonrpc":"2.0","id":1,' +
+      '"method":"tools/call","params":{"name":"fail","arguments":{}}}');
+    Check(PosEx('"result":{"content":[{"type":"text"', response) > 0, response);
+    Check(PosEx('"isError":false}', response) > 0, response);
+  finally
+    server.Free;
+  end;
+end;
+
+procedure TTestMcpCore.InvalidToolResults;
+const
+  INVALID: array[0..10] of RawUtf8 = ('null', 'nocontent', 'notarray',
+    'notbool', 'notobject', 'notype', 'badtype', 'badtext', 'badimage',
+    'badlink', 'badresource');
+var
+  server: TMcpServer;
+  i: PtrInt;
+begin
+  server := NewServer;
+  try
+    // a malformed tool result is a server bug: an internal error
+    for i := 0 to high(INVALID) do
+      CheckError(server, FormatJson('{"jsonrpc":"2.0","id":?,"method":' +
+        '"tools/call","params":{"name":"fail","arguments":{"name":?}}}', [],
+        [i, INVALID[i]]), JSONRPC_INTERNAL_ERROR, Int32ToUtf8(i), 'Internal error');
   finally
     server.Free;
   end;
@@ -742,6 +850,22 @@ begin
       '{"type":"resource","resource":{"uri":"blob://1","blob":"Ymlu"}}]}');
     // a previous Build is not changed by the blocks added afterwards
     CheckEqual(VariantSaveJson(first), '{"content":[{"type":"text","text":"hi"}]}');
+    builder.SetError;
+    CheckEqual(VariantSaveJson(builder.Build), '{"content":[' +
+      '{"type":"text","text":"hi"},' +
+      '{"type":"image","data":"cG5n","mimeType":"image/png","annotations":' +
+        '{"audience":["user","assistant"],"priority":0.5,' +
+        '"lastModified":"2025-01-12T15:00:58Z"}},' +
+      '{"type":"audio","data":"d2F2","mimeType":"audio/wav",' +
+        '"annotations":{"priority":0}},' +
+      '{"type":"resource_link","uri":"file:///a.txt","name":"a.txt",' +
+        '"description":"The A file","mimeType":"text/plain",' +
+        '"annotations":{"audience":["assistant"]}},' +
+      '{"type":"resource_link","uri":"db://x","name":"x"},' +
+      '{"type":"resource","resource":{"uri":"memo://1","mimeType":"text/plain",' +
+        '"text":"memo \"1\""}},' +
+      '{"type":"resource","resource":{"uri":"blob://1","blob":"Ymlu"}}],' +
+      '"isError":true}');
   finally
     builder.Free;
   end;
