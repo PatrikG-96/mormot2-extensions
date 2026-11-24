@@ -1583,7 +1583,8 @@ procedure TMcpListPage.Init(const aList: RawUtf8; const aParams: variant);
 var
   cursor: PVariant;
   doc: TDocVariantData;
-  name: RawUtf8;
+  name, json: RawUtf8;
+  eoj: AnsiChar;
 begin
   List := aList;
   Continued := false;
@@ -1591,14 +1592,19 @@ begin
   if not _Safe(aParams)^.GetAsPVariant('cursor', cursor) or
      VarIsEmptyOrNull(cursor^) then
     exit;
-  if VarIsString(cursor^) and
-     doc.InitJson(Base64uriToBin(VariantToUtf8(cursor^)), JSON_FAST) and
-     GetStringValue(doc, 'list', name) and
-     (name = aList) and
-     GetStringValue(doc, 'after', After) then
+  if VarIsString(cursor^) then
   begin
-    Continued := true;
-    exit;
+    json := Base64uriToBin(VariantToUtf8(cursor^)); // a private buffer
+    // strict parsing: numbers stay numbers, and no trailing data is allowed
+    if (doc.InitJsonInPlace(pointer(json), JSON_FAST_FLOAT, @eoj) <> nil) and
+       (eoj = #0) and
+       GetStringValue(doc, 'list', name) and
+       (name = aList) and
+       GetStringValue(doc, 'after', After) then
+    begin
+      Continued := true;
+      exit;
+    end;
   end;
   raise EMcpException.CreateCode(JSONRPC_INVALID_PARAMS,
     'Invalid cursor for %', [aList]);

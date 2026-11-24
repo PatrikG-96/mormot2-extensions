@@ -760,6 +760,7 @@ var
   response, listName, key, item: RawUtf8;
   doc: TDocVariantData;
   res, list: PDocVariantData;
+  v: PVariant;
   i: PtrInt;
 begin
   result := '';
@@ -783,7 +784,10 @@ begin
     listName := 'resources';
     key := 'uri';
   end;
-  if CheckFailed(res^.GetAsArray(listName, list), response) then
+  if CheckFailed(res^.GetAsPVariant(listName, v), response) then
+    exit;
+  list := _Safe(v^); // may be an empty array
+  if CheckFailed(list^.Kind = dvArray, response) then
     exit;
   for i := 0 to list^.Count - 1 do
   begin
@@ -860,6 +864,21 @@ begin
   finally
     server.Free;
   end;
+  // a valid continuation page may be empty (the rest was unregistered)
+  server := TMcpServer.Create('Empty', '1.0');
+  try
+    server.PageSize := 1;
+    server.RegisterTool(TCalcTool.Create('a', 'tool a'));
+    server.RegisterTool(TCalcTool.Create('b', 'tool b'));
+    server.Start;
+    CheckEqual(ListPage(server, 'tools/list', '', cursor), 'a');
+    Check(cursor <> '');
+    Check(server.UnregisterTool('b'));
+    CheckEqual(ListPage(server, 'tools/list', cursor, next), '', 'empty page');
+    CheckEqual(next, '', 'no nextCursor on the empty page');
+  finally
+    server.Free;
+  end;
 end;
 
 procedure TTestMcpCore.PaginationInvalidCursor;
@@ -888,6 +907,15 @@ begin
       '"params":{"cursor":12}}', JSONRPC_INVALID_PARAMS, '4', 'cursor');
     CheckError(server, '{"jsonrpc":"2.0","id":5,"method":"tools/list",' +
       '"params":{"cursor":""}}', JSONRPC_INVALID_PARAMS, '5', 'cursor');
+    // trailing data after the JSON object, or a number instead of a string
+    CheckError(server, '{"jsonrpc":"2.0","id":9,"method":"tools/list",' +
+      '"params":{"cursor":"' + BinToBase64uri(
+        '{"list":"tools","after":"a"} x') + '"}}',
+      JSONRPC_INVALID_PARAMS, '9', 'cursor');
+    CheckError(server, '{"jsonrpc":"2.0","id":10,"method":"tools/list",' +
+      '"params":{"cursor":"' + BinToBase64uri(
+        '{"list":"tools","after":1e5}') + '"}}',
+      JSONRPC_INVALID_PARAMS, '10', 'cursor');
     // a tools/list cursor is not a resources/list cursor
     CheckError(server, '{"jsonrpc":"2.0","id":6,"method":"resources/list",' +
       '"params":{"cursor":"' + toolsCursor + '"}}',
