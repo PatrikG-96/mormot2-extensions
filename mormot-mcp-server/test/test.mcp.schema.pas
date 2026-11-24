@@ -610,6 +610,9 @@ begin
   CheckReplaceRaises('  ');
   CheckReplaceRaises('{} garbage');
   CheckReplaceRaises('[{}]');
+  // "$defs" must be an object, as for Keyword('$defs', ...)
+  CheckReplaceRaises('{"type":"number","$defs":[{"type":"string"}]}');
+  CheckReplaceRaises('{"type":"number","$defs":"Place"}');
 end;
 
 procedure TTestMcpSchema.SchemaCopies;

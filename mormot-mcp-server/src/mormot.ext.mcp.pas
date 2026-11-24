@@ -550,12 +550,18 @@ begin
   fKeywords.InitFast(dvObject);
 end;
 
+// raise EMcpException if a "$defs" value is not a JSON object
+// - TSchemaWriter.AddDefs merges its members into the root "$defs"
+procedure CheckDefs(aMeta: TMcpSchemaMeta; const aDefs: variant);
+begin
+  if not _Safe(aDefs)^.IsObject then
+    raise EMcpException.CreateUtf8('%: "$defs" is not a JSON object', [aMeta]);
+end;
+
 procedure TMcpSchemaMeta.SetKeyword(const aName: RawUtf8; const aValue: variant);
 begin
-  if (aName = '$defs') and
-     not _Safe(aValue)^.IsObject then
-    raise EMcpException.CreateUtf8('%.Keyword(%): not a JSON object',
-      [self, aName]);
+  if aName = '$defs' then
+    CheckDefs(self, aValue);
   SchemaSafe.Lock;
   try
     fKeywords.AddOrUpdateValue(aName, aValue);
@@ -568,6 +574,7 @@ end;
 procedure TMcpSchemaMeta.SetReplace(const aSchemaJson: RawUtf8);
 var
   schema: TDocVariantData;
+  ndx: PtrInt;
 begin
   // InitJson alone accepts trailing text, and 'null' as a void object: check
   // the whole input as strict JSON, which starts with '{', first
@@ -578,6 +585,9 @@ begin
      not schema.IsObject then
     raise EMcpException.CreateUtf8('%.Replace(%): not a JSON object',
       [self, aSchemaJson]);
+  ndx := schema.GetValueIndex('$defs');
+  if ndx >= 0 then
+    CheckDefs(self, schema.Values[ndx]);
   SchemaSafe.Lock;
   try
     fReplace := variant(schema);
