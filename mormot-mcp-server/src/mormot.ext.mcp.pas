@@ -293,7 +293,9 @@ type
   // their fields and all fields "required"; a record without any field (a
   // tool without parameters) is {"type":"object","additionalProperties":false}
   // - dynamic and static arrays have "items", enumerations an "enum" of their
-  // names, sets an array of those names, nested records their own properties
+  // names without the lowercase prefix (scRed -> Red) or their custom texts,
+  // sets an array of those names, nested records their own properties
+  // - mORMot reads both these names and the full RTTI names
   // - TDateTime, TTimeLog, TUnixTime and TUnixMSTime are "date-time" strings,
   // TDate a "date" string, TGuid a "uuid" string and RawByteString a base64
   // string: the text forms which mORMot reads from JSON
@@ -731,7 +733,8 @@ var
   enum: TDocVariantData;
   i: PtrInt;
 begin
-  // the names which _JL_Enumeration/_JL_Set read, i.e. GetEnumFromText()
+  // custom texts, or the names without their lowercase prefix (scRed -> Red),
+  // which GetEnumFromText() and SetNamesValue() read as well as the full names
   if aRtti.Cache.EnumCustomText <> nil then
   begin
     enum.InitFast(dvArray);
@@ -741,7 +744,7 @@ begin
   end
   else
   begin
-    aRtti.Cache.EnumInfo^.GetEnumNames(names, scNoTrim);
+    aRtti.Cache.EnumInfo^.GetEnumNames(names, scTrimLeft);
     enum.InitArrayFrom(names, JSON_FAST);
   end;
   aSchema.AddValueText('type', 'string');

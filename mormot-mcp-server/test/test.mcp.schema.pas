@@ -84,6 +84,7 @@ type
     Color: TSchemaColor;
     Place: TSchemaPlace;
     Code: TSchemaCode;
+    Colors: TSchemaColors;
   end;
 
   /// nested records referenced with "$ref"
@@ -129,7 +130,7 @@ const
     '{"type":"object","properties":{"Street":{"type":"string"},' +
     '"City":{"type":"string"}},"required":["Street","City"]}';
   SCHEMA_COLOR =
-    '{"type":"string","enum":["scRed","scGreen","scBlue"]}';
+    '{"type":"string","enum":["Red","Green","Blue"]}';
   SCHEMA_PLACE_PROPS =
     '"properties":{"Street":{"type":"string"},' +
     '"City":{"type":"string","default":"Paris"}},"required":["Street"]';
@@ -145,7 +146,9 @@ const
     '"Color":' + SCHEMA_COLOR + ',' +
     '"Place":{"type":"object",' + SCHEMA_PLACE_PROPS +
     ',"description":"Where to search"},' +
-    '"Code":{"type":"string","pattern":"^[A-Z]{3}$"}},' +
+    '"Code":{"type":"string","pattern":"^[A-Z]{3}$"},' +
+    '"Colors":{"type":"array","items":' + SCHEMA_COLOR +
+    ',"uniqueItems":true}},' +
     '"required":["Query","Place","Code"],' +
     '"description":"Search the catalogue"}';
 
@@ -187,7 +190,8 @@ begin
     Rtti.RegisterFromText(TypeInfo(TSchemaPlace), 'Street,City:RawUtf8');
   if not RecordHasFields(TypeInfo(TSchemaSearch)) then
     Rtti.RegisterFromText(TypeInfo(TSchemaSearch), 'Query:RawUtf8 ' +
-      'Limit:integer Color:TSchemaColor Place:TSchemaPlace Code:TSchemaCode');
+      'Limit:integer Color:TSchemaColor Place:TSchemaPlace Code:TSchemaCode ' +
+      'Colors:TSchemaColors');
   if not RecordHasFields(TypeInfo(TSchemaOrder)) then
     Rtti.RegisterFromText(TypeInfo(TSchemaOrder),
       'Billing,Shipping:TSchemaPlace');
@@ -208,7 +212,8 @@ begin
     .Field('Query').Description('Text to search for').Keyword('minLength', 1)
     .Field('Limit').Description('Maximum number of results').DefaultValue(10)
     .Field('Color').Optional
-    .Field('Place').Description('Where to search');
+    .Field('Place').Description('Where to search')
+    .Field('Colors').Optional;
 end;
 
 procedure TTestMcpSchema.CheckSchema(aInfo: PRttiInfo; const aExpected: RawUtf8);
@@ -436,16 +441,20 @@ begin
     // missing fields get their default value, also in nested records,
     // or zero if they have none
     CheckCall('{"Query":"x"}', '{"Query":"x","Limit":10,"Color":0,' +
-      '"Place":{"Street":"","City":"Paris"},"Code":""}');
+      '"Place":{"Street":"","City":"Paris"},"Code":"","Colors":0}');
     CheckCall('{"Query":"x","Place":{"Street":"s"},"Code":"ABC"}',
       '{"Query":"x","Limit":10,"Color":0,' +
-      '"Place":{"Street":"s","City":"Paris"},"Code":"ABC"}');
-    // the arguments override the default values; enumerations are read
-    // from the names published in the schema
-    CheckCall('{"Query":"y","Limit":3,"Color":"scBlue",' +
+      '"Place":{"Street":"s","City":"Paris"},"Code":"ABC","Colors":0}');
+    // the arguments override the default values; enumerations and sets are
+    // read from the names published in the schema
+    CheckCall('{"Query":"y","Limit":3,"Color":"Blue","Colors":["Red","Blue"],' +
       '"Place":{"Street":"s","City":"Lyon"}}',
       '{"Query":"y","Limit":3,"Color":2,' +
-      '"Place":{"Street":"s","City":"Lyon"},"Code":""}');
+      '"Place":{"Street":"s","City":"Lyon"},"Code":"","Colors":5}');
+    // the full RTTI names are still accepted
+    CheckCall('{"Query":"z","Color":"scGreen","Colors":["scGreen"]}',
+      '{"Query":"z","Limit":10,"Color":1,' +
+      '"Place":{"Street":"","City":"Paris"},"Code":"","Colors":2}');
   finally
     server.Free;
   end;
