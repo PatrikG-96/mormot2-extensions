@@ -119,12 +119,14 @@ type
 
   TSchemaPlaceDynArray = array of TSchemaPlace;
   TSchemaPlaceLegs = array[0..1] of TSchemaPlace;
+  TSchemaPlaceRows = array of TSchemaPlaceDynArray;
 
   /// default values in array items and in a record field with a default
   TSchemaRoute = packed record
     Stops: TSchemaPlaceDynArray;
     Legs: TSchemaPlaceLegs;
     Start: TSchemaPlace;
+    Rows: TSchemaPlaceRows;
   end;
 
   /// returns its parameters as JSON text
@@ -259,10 +261,11 @@ begin
     Rtti.RegisterFromText(TypeInfo(TSchemaConflict), 'Order:TSchemaOrder');
   if not RecordHasFields(TypeInfo(TSchemaBounds)) then
     Rtti.RegisterFromText(TypeInfo(TSchemaBounds), 'Ratio:double');
-  Rtti.RegisterTypes([TypeInfo(TSchemaPlaceDynArray), TypeInfo(TSchemaPlaceLegs)]);
+  Rtti.RegisterTypes([TypeInfo(TSchemaPlaceDynArray), TypeInfo(TSchemaPlaceLegs),
+    TypeInfo(TSchemaPlaceRows)]);
   if not RecordHasFields(TypeInfo(TSchemaRoute)) then
     Rtti.RegisterFromText(TypeInfo(TSchemaRoute), 'Stops:TSchemaPlaceDynArray ' +
-      'Legs:TSchemaPlaceLegs Start:TSchemaPlace');
+      'Legs:TSchemaPlaceLegs Start:TSchemaPlace Rows:TSchemaPlaceRows');
 end;
 
 class procedure TTestMcpSchema.RegisterMetadata;
@@ -657,10 +660,16 @@ begin
       '"Legs":[{"Street":"x"},{"Street":"y"}],"Start":{"Street":"Oak"}}',
       '{"Stops":[{"Street":"a","City":"Paris"},{"Street":"b","City":"Lyon"}],' +
       '"Legs":[{"Street":"x","City":"Paris"},{"Street":"y","City":"Paris"}],' +
-      '"Start":{"Street":"Oak","City":"Paris"}}');
+      '"Start":{"Street":"Oak","City":"Paris"},"Rows":[]}');
     // a missing record field gets its own default value
     CheckCall('{}', '{"Stops":[],"Legs":[{"Street":"","City":""},' +
-      '{"Street":"","City":""}],"Start":{"Street":"Main","City":"Rome"}}');
+      '{"Street":"","City":""}],"Start":{"Street":"Main","City":"Rome"},' +
+      '"Rows":[]}');
+    // also the records of arrays of arrays
+    CheckCall('{"Rows":[[{"Street":"Oak"}],[{"Street":"Elm","City":"Nice"}]]}',
+      '{"Stops":[],"Legs":[{"Street":"","City":""},{"Street":"","City":""}],' +
+      '"Start":{"Street":"Main","City":"Rome"},"Rows":[[{"Street":"Oak",' +
+      '"City":"Paris"}],[{"Street":"Elm","City":"Nice"}]]}');
   finally
     server.Free;
   end;

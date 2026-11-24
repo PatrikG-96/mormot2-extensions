@@ -179,8 +179,9 @@ type
     Value: variant;
     /// if Value is set
     HasValue: boolean;
-    /// if Node applies to the items of this array field
-    Items: boolean;
+    /// how many array layers contain the Node records, e.g. 1 for an array
+    // of records, 2 for an array of arrays of records, 0 for a record
+    Depth: integer;
     /// the index of the defaults of the nested record type, or -1
     Node: integer;
   end;
@@ -1054,13 +1055,13 @@ begin
           e.Value := value^
         else
           VarClear(e.Value);
-        e.Items := false;
+        e.Depth := 0;
         e.Node := -1;
         item := p^.Value;
-        if (item.Parser in [ptArray, ptDynArray]) and
-           (item.ArrayRtti <> nil) then
+        while (item.Parser in [ptArray, ptDynArray]) and
+              (item.ArrayRtti <> nil) do
         begin
-          e.Items := true;
+          inc(e.Depth); // as TSchemaWriter.WriteType, through all layers
           item := item.ArrayRtti;
         end;
         if item.Kind in rkRecordTypes then
@@ -1128,10 +1129,25 @@ end;
 procedure AddDefaults(const aDefaults: TMcpSchemaDefaults; aNode: PtrInt;
   var aArgs: TDocVariantData);
 var
-  i, j, ndx: PtrInt;
+  i, ndx: PtrInt;
   e: ^TMcpSchemaDefault;
   nested: TDocVariantData;
-  value: PDocVariantData;
+
+  // complete a supplied record, or the records of supplied arrays
+  procedure Complete(var aValue: TDocVariantData; aDepth: integer);
+  var
+    j: PtrInt;
+  begin
+    if aDepth = 0 then
+    begin
+      if aValue.IsObject then
+        AddDefaults(aDefaults, e^.Node, aValue);
+    end
+    else if aValue.IsArray then
+      for j := 0 to aValue.Count - 1 do
+        Complete(_Safe(aValue.Values[j])^, aDepth - 1);
+  end;
+
 begin
   for i := 0 to high(aDefaults[aNode]) do
   begin
@@ -1141,7 +1157,7 @@ begin
     begin
       if e^.HasValue then
         aArgs.AddValue(e^.Name, e^.Value)
-      else if not e^.Items then
+      else if e^.Depth = 0 then
       begin
         // a missing record: the default values of its own fields
         nested.InitFast(dvObject);
@@ -1152,19 +1168,7 @@ begin
       end;
     end
     else if e^.Node >= 0 then
-    begin
-      // a supplied record, or array of records: complete each of them
-      value := _Safe(aArgs.Values[ndx]);
-      if e^.Items then
-      begin
-        if value^.IsArray then
-          for j := 0 to value^.Count - 1 do
-            if _Safe(value^.Values[j])^.IsObject then
-              AddDefaults(aDefaults, e^.Node, _Safe(value^.Values[j])^);
-      end
-      else if value^.IsObject then
-        AddDefaults(aDefaults, e^.Node, value^);
-    end;
+      Complete(_Safe(aArgs.Values[ndx])^, e^.Depth);
   end;
 end;
 
