@@ -77,6 +77,8 @@ procedure EnsureClaudeRtti;
 begin
   if not RecordHasFields(TypeInfo(TAskClaudeParams)) then
     Rtti.RegisterFromText(TypeInfo(TAskClaudeParams), 'Prompt:RawUtf8');
+  McpSchema(TypeInfo(TAskClaudeParams))
+    .Field('Prompt').Description('The question or instruction for Claude');
 end;
 
 function QuoteCmd(const aPath: TFileName): TFileName;

@@ -18,6 +18,22 @@ Pure mORMot v2 implementation of the Model Context Protocol (MCP) with JSON‑RP
 - `demo.mcp.stdio`  
   Line‑delimited JSON‑RPC over stdin/stdout (for CLI/agent/RPC integration).
 
+## Tool parameter schemas
+A `TMcpToolBase<T>` tool publishes the JSON Schema of its parameter record `T`,
+generated from its RTTI: nested records, arrays, enumerations (by name), dates
+and GUIDs. Field names keep their casing. Describe the record with `McpSchema()`
+(on FPC 3.2.2, after `Rtti.RegisterFromText()`):
+```pascal
+McpSchema(TypeInfo(TSearchParams))
+  .Description('Search the catalogue')
+  .Field('Query').Description('Text to search for').Keyword('minLength', 1)
+  .Field('Limit').Description('Maximum number of results').DefaultValue(10)
+  .Field('Sort').Optional;
+```
+A field is required unless it is `Optional` or has a `DefaultValue`, which the
+tool receives when the argument is missing. `Keyword()` sets any JSON Schema
+2020-12 keyword, and `Replace()` replaces a generated schema (e.g. by a `$ref`).
+
 ## MCP Inspector
 You can explore your MCP server using the official MCP Inspector. Just run `pnpx @modelcontextprotocol/inspector` (`NodeJS` is required)
 
