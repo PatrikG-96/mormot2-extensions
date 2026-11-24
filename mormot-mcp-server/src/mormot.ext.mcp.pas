@@ -471,14 +471,14 @@ begin
     aValue := VariantToUtf8(v^);
 end;
 
-// write '{"jsonrpc":"2.0"' and the "id" member, if any
-procedure AddMessageStart(W: TJsonWriter; const aRequestId: variant);
+// start a message with "jsonrpc" and the "id" member, if any
+// - the id is left out when unknown: MCP doesn't allow "id": null
+procedure InitMessage(var aDoc: TDocVariantData; const aRequestId: variant);
 begin
-  W.AddShort('{"jsonrpc":"2.0"');
-  if VarIsEmptyOrNull(aRequestId) then
-    exit;
-  W.AddShort(',"id":');
-  W.AddVariant(aRequestId);
+  aDoc.InitFast;
+  aDoc.AddValue('jsonrpc', '2.0');
+  if not VarIsEmptyOrNull(aRequestId) then
+    aDoc.AddValue('id', aRequestId);
 end;
 
 class function TMcpJsonRpcProcessor.ParseMessage(const aJson: RawUtf8;
@@ -575,44 +575,25 @@ end;
 class function TMcpJsonRpcProcessor.CreateSuccessResponse(
   const aRequestId, aResult: variant): RawUtf8;
 var
-  W: TJsonWriter;
-  tmp: TTextWriterStackBuffer;
+  doc: TDocVariantData;
 begin
-  W := TJsonWriter.CreateOwnedStream(tmp);
-  try
-    AddMessageStart(W, aRequestId);
-    W.AddShort(',"result":');
-    W.AddVariant(aResult);
-    W.AddDirect('}');
-    W.SetText(result);
-  finally
-    W.Free;
-  end;
+  InitMessage(doc, aRequestId);
+  doc.AddValue('result', aResult);
+  result := doc.ToJson;
 end;
 
 class function TMcpJsonRpcProcessor.CreateError(const aRequestId: variant;
   aErrorCode: integer; const aErrorMsg: RawUtf8; const aData: variant): RawUtf8;
 var
-  W: TJsonWriter;
-  tmp: TTextWriterStackBuffer;
+  doc: TDocVariantData;
+  error: variant;
 begin
-  W := TJsonWriter.CreateOwnedStream(tmp);
-  try
-    AddMessageStart(W, aRequestId);
-    W.AddShort(',"error":{"code":');
-    W.Add(aErrorCode);
-    W.AddShort(',"message":');
-    W.AddJsonString(aErrorMsg);
-    if not VarIsEmptyOrNull(aData) then
-    begin
-      W.AddShort(',"data":');
-      W.AddVariant(aData);
-    end;
-    W.AddDirect('}', '}');
-    W.SetText(result);
-  finally
-    W.Free;
-  end;
+  error := _ObjFast(['code', aErrorCode, 'message', aErrorMsg]);
+  if not VarIsEmptyOrNull(aData) then
+    TDocVariantData(error).AddValue('data', aData);
+  InitMessage(doc, aRequestId);
+  doc.AddValue('error', error);
+  result := doc.ToJson;
 end;
 
 class function TMcpJsonRpcProcessor.CreateError(const aRequestId: variant;
