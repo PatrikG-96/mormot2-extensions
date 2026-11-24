@@ -2031,12 +2031,26 @@ begin
   result := page.Done(resources);
 end;
 
+// case-sensitive lookup, whatever the dvoNameCaseSensitive option of aDoc is
+// - JSON_FAST documents find names case-insensitively, but "Content" or "Text"
+// would be sent as-is, and are not valid MCP member names
+function FindMember(const aDoc: TDocVariantData; const aName: RawUtf8;
+  out aValue: PVariant): boolean;
+var
+  i: integer;
+begin
+  i := aDoc.GetValueIndex(pointer(aName), length(aName), {casesens=}true);
+  result := i >= 0;
+  if result then
+    aValue := @aDoc.Values[i];
+end;
+
 // true if aName is a JSON string member of aDoc
 function HasString(const aDoc: TDocVariantData; const aName: RawUtf8): boolean;
 var
   v: PVariant;
 begin
-  result := aDoc.GetAsPVariant(aName, v) and
+  result := FindMember(aDoc, aName, v) and
             VarIsString(v^);
 end;
 
@@ -2044,41 +2058,48 @@ end;
 function CheckContentBlock(const aBlock: variant): RawUtf8;
 var
   block, resource: PDocVariantData;
+  v: PVariant;
   typ: RawUtf8;
 begin
   result := '';
   if not _SafeObject(aBlock, block) then
     result := 'not a JSON object'
-  else if not GetStringValue(block^, 'type', typ) then
+  else if not HasString(block^, 'type') then
     result := 'no "type"'
-  else if typ = 'text' then
-  begin
-    if not HasString(block^, 'text') then
-      result := 'no "text"';
-  end
-  else if (typ = 'image') or
-          (typ = 'audio') then
-  begin
-    if not HasString(block^, 'data') or
-       not HasString(block^, 'mimeType') then
-      result := 'no "data" or "mimeType"';
-  end
-  else if typ = 'resource_link' then
-  begin
-    if not HasString(block^, 'uri') or
-       not HasString(block^, 'name') then
-      result := 'no "uri" or "name"';
-  end
-  else if typ = 'resource' then
-  begin
-    if not block^.GetAsObject('resource', resource) or
-       not HasString(resource^, 'uri') or
-       not (HasString(resource^, 'text') or
-            HasString(resource^, 'blob')) then
-      result := 'no "resource" with "uri" and "text" or "blob"';
-  end
   else
-    result := 'unknown "type"';
+  begin
+    FindMember(block^, 'type', v);
+    VariantToUtf8(v^, typ);
+    if typ = 'text' then
+    begin
+      if not HasString(block^, 'text') then
+        result := 'no "text"';
+    end
+    else if (typ = 'image') or
+            (typ = 'audio') then
+    begin
+      if not HasString(block^, 'data') or
+         not HasString(block^, 'mimeType') then
+        result := 'no "data" or "mimeType"';
+    end
+    else if typ = 'resource_link' then
+    begin
+      if not HasString(block^, 'uri') or
+         not HasString(block^, 'name') then
+        result := 'no "uri" or "name"';
+    end
+    else if typ = 'resource' then
+    begin
+      if not FindMember(block^, 'resource', v) or
+         not _SafeObject(v^, resource) or
+         not HasString(resource^, 'uri') or
+         not (HasString(resource^, 'text') or
+              HasString(resource^, 'blob')) then
+        result := 'no "resource" with "uri" and "text" or "blob"';
+    end
+    else
+      result := 'unknown "type"';
+  end;
 end;
 
 // returns '' if aResult is a valid CallToolResult, or why it is not
@@ -2091,10 +2112,10 @@ begin
   result := '';
   if not _SafeObject(aResult, res) then
     result := 'not a JSON object'
-  else if not res^.GetAsDocVariant('content', content) or
-          not content^.IsArray then
+  else if not FindMember(res^, 'content', v) or
+          not _SafeArray(v^, content) then
     result := 'no "content" array'
-  else if res^.GetAsPVariant('isError', v) and
+  else if FindMember(res^, 'isError', v) and
           (TVarData(v^).VType <> varBoolean) then
     result := '"isError" is not a boolean'
   else
@@ -2390,6 +2411,13 @@ begin
     raise EMcpException.CreateUtf8('File not found: %', [aFilePath]);
   content := StringFromFile(fileName);
   mimeType := GetMimeContentType(content, fileName);
+  // the framework knows no audio format (it may guess "application/wav"
+  // from the extension): recognize the WAV files by their RIFF/WAVE tag
+  if not IdemPChar(pointer(mimeType), 'AUDIO/') then
+    if (length(content) > 12) and
+       (PCardinal(content)^ = $46464952) and // 'RIFF'
+       (PCardinalArray(content)^[2] = $45564157) then
+      mimeType := 'audio/wav';
   if IdemPChar(pointer(mimeType), 'IMAGE/') then
     result := AddImage(content, mimeType)
   else if IdemPChar(pointer(mimeType), 'AUDIO/') then
@@ -2407,14 +2435,18 @@ end;
 function TMcpResponseBuilder.Annotate(
   const aAnnotations: TMcpAnnotations): TMcpResponseBuilder;
 var
-  annotations: variant;
+  annotations, block: variant;
 begin
   if fContent.Count = 0 then
     raise EMcpException.Create('TMcpResponseBuilder.Annotate: no block yet');
   annotations := aAnnotations.ToVariant;
   if not VarIsEmptyOrNull(annotations) then
-    _Safe(fContent.Values[fContent.Count - 1])^.
-      AddOrUpdateValue('annotations', annotations);
+  begin
+    // copy the block: a previous Build shares it, and must not change
+    block := _Copy(fContent.Values[fContent.Count - 1]);
+    _Safe(block)^.AddOrUpdateValue('annotations', annotations);
+    fContent.Values[fContent.Count - 1] := block;
+  end;
   result := self;
 end;
 

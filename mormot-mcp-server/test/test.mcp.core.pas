@@ -153,6 +153,10 @@ begin
     result := _JsonFast('{"content":[{"type":"image","data":"eA=="}]}')
   else if aParams.Name = 'badlink' then
     result := _JsonFast('{"content":[{"type":"resource_link","uri":"a://b"}]}')
+  else if aParams.Name = 'badcase' then
+    result := _JsonFast('{"Content":[{"type":"text","text":"x"}]}')
+  else if aParams.Name = 'badcaseblock' then
+    result := _JsonFast('{"content":[{"Type":"text","Text":"x"}]}')
   else if aParams.Name = 'badresource' then
     result := _JsonFast('{"content":[{"type":"resource","resource":{"uri":"a://b"}}]}')
   else
@@ -459,9 +463,10 @@ end;
 procedure TTestMcpCore.ResponseBuilderTextAndFile;
 const
   PNG: RawByteString = #$89'PNG'#13#10#$1a#10'data';
+  WAV: RawByteString = 'RIFF'#4#0#0#0'WAVEfmt data';
 var
   builder: TMcpResponseBuilder;
-  binFile, pngFile: TFileName;
+  binFile, pngFile, wavFile: TFileName;
   content: RawByteString;
   response: variant;
 begin
@@ -470,6 +475,8 @@ begin
   content := 'mcp-test';
   Check(FileFromString(content, binFile));
   Check(FileFromString(PNG, pngFile));
+  wavFile := binFile + '.wav';
+  Check(FileFromString(WAV, wavFile));
   try
     builder := TMcpResponseBuilder.Create;
     try
@@ -479,6 +486,8 @@ begin
       builder.AddFile(StringToUtf8(binFile), 'my report.bin');
       // an image file: an image block
       builder.AddFile(StringToUtf8(pngFile));
+      // a WAV file: an audio block
+      builder.AddFile(StringToUtf8(wavFile));
       response := builder.Build;
     finally
       builder.Free;
@@ -486,13 +495,15 @@ begin
     CheckEqual(VariantSaveJson(response), FormatJson('{"content":[' +
       '{"type":"text","text":"hello"},' +
       '{"type":"resource","resource":{"uri":?,"mimeType":?,"blob":?}},' +
-      '{"type":"image","data":?,"mimeType":"image/png"}]}', [],
+      '{"type":"image","data":?,"mimeType":"image/png"},' +
+      '{"type":"audio","data":?,"mimeType":"audio/wav"}]}', [],
       ['file:///my%20report.bin', GetMimeContentType(content, binFile),
        BinToBase64(content),
-       BinToBase64(PNG)]));
+       BinToBase64(PNG), BinToBase64(WAV)]));
   finally
     DeleteFile(binFile);
     DeleteFile(pngFile);
+    DeleteFile(wavFile);
   end;
 end;
 
@@ -794,9 +805,9 @@ end;
 
 procedure TTestMcpCore.InvalidToolResults;
 const
-  INVALID: array[0..10] of RawUtf8 = ('null', 'nocontent', 'notarray',
+  INVALID: array[0..12] of RawUtf8 = ('null', 'nocontent', 'notarray',
     'notbool', 'notobject', 'notype', 'badtype', 'badtext', 'badimage',
-    'badlink', 'badresource');
+    'badlink', 'badresource', 'badcase', 'badcaseblock');
 var
   server: TMcpServer;
   i: PtrInt;
@@ -866,6 +877,18 @@ begin
         '"text":"memo \"1\""}},' +
       '{"type":"resource","resource":{"uri":"blob://1","blob":"Ymlu"}}],' +
       '"isError":true}');
+  finally
+    builder.Free;
+  end;
+  // Annotate after Build does not change the result already built
+  builder := TMcpResponseBuilder.Create;
+  try
+    builder.AddText('a');
+    first := builder.Build;
+    builder.Annotate(McpAnnotations([mrUser]));
+    CheckEqual(VariantSaveJson(first), '{"content":[{"type":"text","text":"a"}]}');
+    CheckEqual(VariantSaveJson(builder.Build), '{"content":[{"type":"text",' +
+      '"text":"a","annotations":{"audience":["user"]}}]}');
   finally
     builder.Free;
   end;
