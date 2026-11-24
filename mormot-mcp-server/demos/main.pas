@@ -172,15 +172,9 @@ begin
 end;
 
 function TGetIpTool.GetInputSchema: variant;
-var
-  doc, props, req: TDocVariantData;
 begin
-  doc.InitObject(['type', 'object'], JSON_FAST);
-  props.InitObject([], JSON_FAST);
-  req.InitArray([], JSON_FAST);
-  doc.AddValue('properties', variant(props));
-  doc.AddValue('required', variant(req));
-  result := variant(doc);
+  // no parameters: the MCP specification recommends to accept only {}
+  result := _ObjFast(['type', 'object', 'additionalProperties', false]);
 end;
 
 function TGetIpTool.Execute(const aArgs: variant; const aAuthCtx: TMcpAuthContext): variant;

@@ -59,6 +59,10 @@ procedure EnsureDemoRtti;
 begin
   if not RecordHasFields(TypeInfo(TAddParams)) then
     Rtti.RegisterFromText(TypeInfo(TAddParams), 'a,b:integer');
+  // descriptions for the client, published in the tool's inputSchema
+  McpSchema(TypeInfo(TAddParams))
+    .Field('a').Description('First number to add')
+    .Field('b').Description('Second number to add, 0 if omitted').DefaultValue(0);
   if not RecordHasFields(TypeInfo(TIpInfo)) then
     Rtti.RegisterFromText(TypeInfo(TIpInfo), 'Ip:RawUtf8 Date:TDateTime');
 end;
@@ -107,15 +111,9 @@ begin
 end;
 
 function TGetIpTool.GetInputSchema: variant;
-var
-  doc, props, req: TDocVariantData;
 begin
-  doc.InitObject(['type', 'object'], JSON_FAST);
-  props.InitObject([], JSON_FAST);
-  req.InitArray([], JSON_FAST);
-  doc.AddValue('properties', variant(props));
-  doc.AddValue('required', variant(req));
-  result := variant(doc);
+  // no parameters: the MCP specification recommends to accept only {}
+  result := _ObjFast(['type', 'object', 'additionalProperties', false]);
 end;
 
 function TGetIpTool.Execute(const aArgs: variant; const aAuthCtx: TMcpAuthContext): variant;
