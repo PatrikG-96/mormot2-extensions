@@ -58,6 +58,9 @@ type
     procedure CheckError(aServer: TMcpServer; const aRequest: RawUtf8;
       aExpectedCode: integer; const aIdJson: RawUtf8;
       const aMessageContains: RawUtf8 = '');
+    // - return the "name" (or "uri") members of one list page, comma separated
+    function ListPage(aServer: TMcpServer; const aMethod, aCursor: RawUtf8;
+      out aNextCursor: RawUtf8): RawUtf8;
   published
     procedure SchemaFromRecord;
     procedure JsonRpcProcessor;
@@ -75,6 +78,8 @@ type
     procedure ToolExceptions;
     procedure NotificationWhileStopped;
     procedure NotificationMethodAsRequest;
+    procedure Pagination;
+    procedure PaginationInvalidCursor;
   end;
 
 implementation
@@ -747,5 +752,192 @@ begin
     server.Free;
   end;
 end;
+
+function TTestMcpCore.ListPage(aServer: TMcpServer;
+  const aMethod, aCursor: RawUtf8; out aNextCursor: RawUtf8): RawUtf8;
+var
+  params, request: variant;
+  response, listName, key, item: RawUtf8;
+  doc: TDocVariantData;
+  res, list: PDocVariantData;
+  v: PVariant;
+  i: PtrInt;
+begin
+  result := '';
+  aNextCursor := '';
+  params := _ObjFast([]);
+  if aCursor <> '' then
+    _ObjAddProp('cursor', aCursor, params);
+  request := _ObjFast(['jsonrpc', '2.0', 'id', 1, 'method', aMethod,
+    'params', params]);
+  response := aServer.ExecuteRequest(VariantSaveJson(request));
+  if CheckFailed(doc.InitJson(response, JSON_FAST), response) or
+     CheckFailed(doc.GetAsObject('result', res), response) then
+    exit;
+  if aMethod = 'tools/list' then
+  begin
+    listName := 'tools';
+    key := 'name';
+  end
+  else
+  begin
+    listName := 'resources';
+    key := 'uri';
+  end;
+  if CheckFailed(res^.GetAsPVariant(listName, v), response) then
+    exit;
+  list := _Safe(v^); // may be an empty array
+  if CheckFailed(list^.Kind = dvArray, response) then
+    exit;
+  for i := 0 to list^.Count - 1 do
+  begin
+    item := _Safe(list^.Values[i])^.U[key];
+    if result = '' then
+      result := item
+    else
+      result := result + ',' + item;
+  end;
+  if res^.GetAsRawUtf8('nextCursor', aNextCursor) then
+    Check(aNextCursor <> '', 'nextCursor must not be empty');
+end;
+
+procedure TTestMcpCore.Pagination;
+var
+  server: TMcpServer;
+  cursor, first, next: RawUtf8;
+begin
+  EnsureCalcParamsRtti;
+  server := TMcpServer.Create('TestServer', '1.0');
+  try
+    CheckEqual(server.PageSize, MCP_DEFAULT_PAGE_SIZE, 'default page size');
+    // registration order is not the listing order: pages follow the names
+    server.RegisterTool(TCalcTool.Create('e', 'tool e'));
+    server.RegisterTool(TCalcTool.Create('b', 'tool b'));
+    server.RegisterTool(TCalcTool.Create('d', 'tool d'));
+    server.RegisterTool(TCalcTool.Create('a', 'tool a'));
+    server.RegisterTool(TCalcTool.Create('c', 'tool c'));
+    server.RegisterResource(TVersionResource.Create('v://3', '3', '', 'text/plain'));
+    server.RegisterResource(TVersionResource.Create('v://1', '1', '', 'text/plain'));
+    server.RegisterResource(TVersionResource.Create('v://2', '2', '', 'text/plain'));
+    server.Start;
+    // fewer items than a page: one page, no nextCursor
+    CheckEqual(ListPage(server, 'tools/list', '', cursor), 'a,b,c,d,e');
+    CheckEqual(cursor, '', 'no nextCursor on the only page');
+    // page through all items
+    server.PageSize := 2;
+    CheckEqual(ListPage(server, 'tools/list', '', cursor), 'a,b', 'page 1');
+    Check(cursor <> '', 'page 1 nextCursor');
+    first := cursor;
+    CheckEqual(ListPage(server, 'tools/list', first, next), 'c,d', 'page 2');
+    CheckEqual(ListPage(server, 'tools/list', next, cursor), 'e', 'page 3');
+    CheckEqual(cursor, '', 'no nextCursor on the last page');
+    // a page which ends exactly at the last item has no nextCursor either
+    server.PageSize := 5;
+    CheckEqual(ListPage(server, 'tools/list', '', cursor), 'a,b,c,d,e');
+    CheckEqual(cursor, '', 'full last page');
+    // the cursor carries its own position: it survives list changes
+    server.PageSize := 2;
+    Check(server.UnregisterTool('b'));
+    server.RegisterTool(TCalcTool.Create('aa', 'tool aa'));
+    CheckEqual(ListPage(server, 'tools/list', first, next), 'c,d',
+      'cursor after a removed item');
+    server.PageSize := 0; // 0 = no pagination
+    CheckEqual(ListPage(server, 'tools/list', '', next), 'a,aa,c,d,e');
+    CheckEqual(next, '', 'PageSize=0 sends everything');
+    CheckEqual(ListPage(server, 'tools/list', first, next), 'c,d,e',
+      'PageSize=0 still honours a cursor');
+    // resources/list
+    server.PageSize := 2;
+    CheckEqual(ListPage(server, 'resources/list', '', cursor), 'v://1,v://2');
+    CheckEqual(ListPage(server, 'resources/list', cursor, next), 'v://3');
+    CheckEqual(next, '');
+  finally
+    server.Free;
+  end;
+  // a cursor is not bound to the server instance which made it
+  server := TMcpServer.Create('Other', '1.0');
+  try
+    server.RegisterTool(TCalcTool.Create('z', 'tool z'));
+    server.Start;
+    CheckEqual(ListPage(server, 'tools/list', first, next), 'z',
+      'cursor from another instance');
+  finally
+    server.Free;
+  end;
+  // a valid continuation page may be empty (the rest was unregistered)
+  server := TMcpServer.Create('Empty', '1.0');
+  try
+    server.PageSize := 1;
+    server.RegisterTool(TCalcTool.Create('a', 'tool a'));
+    server.RegisterTool(TCalcTool.Create('b', 'tool b'));
+    server.Start;
+    CheckEqual(ListPage(server, 'tools/list', '', cursor), 'a');
+    Check(cursor <> '');
+    Check(server.UnregisterTool('b'));
+    CheckEqual(ListPage(server, 'tools/list', cursor, next), '', 'empty page');
+    CheckEqual(next, '', 'no nextCursor on the empty page');
+  finally
+    server.Free;
+  end;
+end;
+
+procedure TTestMcpCore.PaginationInvalidCursor;
+var
+  server: TMcpServer;
+  toolsCursor, resCursor: RawUtf8;
+begin
+  server := NewServer;
+  try
+    server.PageSize := 1;
+    ListPage(server, 'tools/list', '', toolsCursor);
+    ListPage(server, 'resources/list', '', resCursor); // single resource
+    Check(toolsCursor <> '');
+    CheckEqual(resCursor, '');
+    CheckError(server, '{"jsonrpc":"2.0","id":1,"method":"tools/list",' +
+      '"params":{"cursor":"not a cursor!"}}', JSONRPC_INVALID_PARAMS, '1',
+      'cursor');
+    // valid base64url, but not one of our cursors
+    CheckError(server, '{"jsonrpc":"2.0","id":2,"method":"tools/list",' +
+      '"params":{"cursor":"' + BinToBase64uri('hello') + '"}}',
+      JSONRPC_INVALID_PARAMS, '2', 'cursor');
+    CheckError(server, '{"jsonrpc":"2.0","id":3,"method":"tools/list",' +
+      '"params":{"cursor":"' + BinToBase64uri('{"list":"tools"}') + '"}}',
+      JSONRPC_INVALID_PARAMS, '3', 'cursor');
+    CheckError(server, '{"jsonrpc":"2.0","id":4,"method":"tools/list",' +
+      '"params":{"cursor":12}}', JSONRPC_INVALID_PARAMS, '4', 'cursor');
+    CheckError(server, '{"jsonrpc":"2.0","id":5,"method":"tools/list",' +
+      '"params":{"cursor":""}}', JSONRPC_INVALID_PARAMS, '5', 'cursor');
+    // trailing data after the JSON object, or a number instead of a string
+    CheckError(server, '{"jsonrpc":"2.0","id":9,"method":"tools/list",' +
+      '"params":{"cursor":"' + BinToBase64uri(
+        '{"list":"tools","after":"a"} x') + '"}}',
+      JSONRPC_INVALID_PARAMS, '9', 'cursor');
+    CheckError(server, '{"jsonrpc":"2.0","id":10,"method":"tools/list",' +
+      '"params":{"cursor":"' + BinToBase64uri(
+        '{"list":"tools","after":1e5}') + '"}}',
+      JSONRPC_INVALID_PARAMS, '10', 'cursor');
+    // unquoted names, or an embedded NUL followed by garbage
+    CheckError(server, '{"jsonrpc":"2.0","id":11,"method":"tools/list",' +
+      '"params":{"cursor":"' + BinToBase64uri(
+        '{list:"tools",after:"a"}') + '"}}',
+      JSONRPC_INVALID_PARAMS, '11', 'cursor');
+    CheckError(server, '{"jsonrpc":"2.0","id":12,"method":"tools/list",' +
+      '"params":{"cursor":"' + BinToBase64uri(
+        '{"list":"tools","after":"a"}'#0'garbage') + '"}}',
+      JSONRPC_INVALID_PARAMS, '12', 'cursor');
+    // a tools/list cursor is not a resources/list cursor
+    CheckError(server, '{"jsonrpc":"2.0","id":6,"method":"resources/list",' +
+      '"params":{"cursor":"' + toolsCursor + '"}}',
+      JSONRPC_INVALID_PARAMS, '6', 'cursor');
+    // "params" may be absent, and a null cursor means none
+    Check(PosEx('"tools"', server.ExecuteRequest(
+      '{"jsonrpc":"2.0","id":7,"method":"tools/list"}')) > 0);
+    Check(PosEx('"tools"', server.ExecuteRequest(
+      '{"jsonrpc":"2.0","id":8,"method":"tools/list","params":{"cursor":null}}')) > 0);
+  finally
+    server.Free;
+  end;
+end;
+
 
 end.
