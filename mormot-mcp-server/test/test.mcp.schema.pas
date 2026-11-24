@@ -97,10 +97,47 @@ type
     Value: integer;
   end;
 
+  /// "$defs" from a Keyword(), and a generated one for a recursive type
+  TSchemaForest = packed record
+    Tree: TSchemaNode;
+    Billing: TSchemaPlace;
+  end;
+
+  /// a nested type (TSchemaOrder) with its own "$defs"
+  TSchemaCheckout = packed record
+    Order: TSchemaOrder;
+  end;
+
+  /// "$defs" defined twice with a different content
+  TSchemaConflict = packed record
+    Order: TSchemaOrder;
+  end;
+
+  TSchemaBounds = packed record
+    Ratio: double;
+  end;
+
+  TSchemaPlaceDynArray = array of TSchemaPlace;
+  TSchemaPlaceLegs = array[0..1] of TSchemaPlace;
+
+  /// default values in array items and in a record field with a default
+  TSchemaRoute = packed record
+    Stops: TSchemaPlaceDynArray;
+    Legs: TSchemaPlaceLegs;
+    Start: TSchemaPlace;
+  end;
+
   /// returns its parameters as JSON text
   TSchemaSearchTool = class(TMcpToolBase<TSchemaSearch>)
   protected
     function ExecuteTyped(const aParams: TSchemaSearch;
+      const aAuthCtx: TMcpAuthContext): variant; override;
+  end;
+
+  /// returns its parameters as JSON text
+  TSchemaRouteTool = class(TMcpToolBase<TSchemaRoute>)
+  protected
+    function ExecuteTyped(const aParams: TSchemaRoute;
       const aAuthCtx: TMcpAuthContext): variant; override;
   end;
 
@@ -123,9 +160,15 @@ type
     procedure SchemaCache;
     procedure ToolsList;
     procedure ToolsCallDefaults;
+    procedure DefsHoisted;
+    procedure ReplaceParsing;
+    procedure SchemaCopies;
   end;
 
 const
+  SCHEMA_NODE_PROPS =
+    '"properties":{"Name":{"type":"string"},"Children":{"type":"array",' +
+    '"items":{"$ref":"#/$defs/TSchemaNode"}}},"required":["Name","Children"]';
   SCHEMA_ADDRESS =
     '{"type":"object","properties":{"Street":{"type":"string"},' +
     '"City":{"type":"string"}},"required":["Street","City"]}';
@@ -164,6 +207,15 @@ begin
     'text', RecordSaveJson(aParams, TypeInfo(TSchemaSearch))])])]);
 end;
 
+{ TSchemaRouteTool }
+
+function TSchemaRouteTool.ExecuteTyped(const aParams: TSchemaRoute;
+  const aAuthCtx: TMcpAuthContext): variant;
+begin
+  result := _ObjFast(['content', _ArrFast([_ObjFast(['type', 'text',
+    'text', RecordSaveJson(aParams, TypeInfo(TSchemaRoute))])])]);
+end;
+
 { TTestMcpSchema }
 
 class procedure TTestMcpSchema.RegisterTypes;
@@ -197,6 +249,19 @@ begin
       'Billing,Shipping:TSchemaPlace');
   if not RecordHasFields(TypeInfo(TSchemaCached)) then
     Rtti.RegisterFromText(TypeInfo(TSchemaCached), 'Value:integer');
+  if not RecordHasFields(TypeInfo(TSchemaForest)) then
+    Rtti.RegisterFromText(TypeInfo(TSchemaForest),
+      'Tree:TSchemaNode Billing:TSchemaPlace');
+  if not RecordHasFields(TypeInfo(TSchemaCheckout)) then
+    Rtti.RegisterFromText(TypeInfo(TSchemaCheckout), 'Order:TSchemaOrder');
+  if not RecordHasFields(TypeInfo(TSchemaConflict)) then
+    Rtti.RegisterFromText(TypeInfo(TSchemaConflict), 'Order:TSchemaOrder');
+  if not RecordHasFields(TypeInfo(TSchemaBounds)) then
+    Rtti.RegisterFromText(TypeInfo(TSchemaBounds), 'Ratio:double');
+  Rtti.RegisterTypes([TypeInfo(TSchemaPlaceDynArray), TypeInfo(TSchemaPlaceLegs)]);
+  if not RecordHasFields(TypeInfo(TSchemaRoute)) then
+    Rtti.RegisterFromText(TypeInfo(TSchemaRoute), 'Stops:TSchemaPlaceDynArray ' +
+      'Legs:TSchemaPlaceLegs Start:TSchemaPlace');
 end;
 
 class procedure TTestMcpSchema.RegisterMetadata;
@@ -282,10 +347,6 @@ begin
 end;
 
 procedure TTestMcpSchema.RecursiveTypes;
-const
-  NODE_PROPS =
-    '"properties":{"Name":{"type":"string"},"Children":{"type":"array",' +
-    '"items":{"$ref":"#/$defs/TSchemaNode"}}},"required":["Name","Children"]';
 begin
   RegisterTypes;
   // the root type refers to itself as "#"
@@ -295,9 +356,9 @@ begin
     '"required":["Name","Children"]}');
   // a nested recursive type is defined once in "$defs"
   CheckSchema(TypeInfo(TSchemaTree),
-    '{"type":"object","properties":{"Root":{"type":"object",' + NODE_PROPS +
+    '{"type":"object","properties":{"Root":{"type":"object",' + SCHEMA_NODE_PROPS +
     '}},"required":["Root"],"$defs":{"TSchemaNode":{"type":"object",' +
-    NODE_PROPS + '}}}');
+    SCHEMA_NODE_PROPS + '}}}');
 end;
 
 procedure TTestMcpSchema.Metadata;
@@ -382,14 +443,18 @@ var
   s1, s2: variant;
 begin
   RegisterTypes;
-  s1 := TMcpSchemaGenerator.GenerateSchema(TypeInfo(TSchemaCached));
-  s2 := TMcpSchemaGenerator.GenerateSchema(TypeInfo(TSchemaCached));
+  s1 := McpSchema(TypeInfo(TSchemaCached)).Schema;
+  s2 := McpSchema(TypeInfo(TSchemaCached)).Schema;
   CheckEqual(VariantSaveJson(s1), BEFORE);
   Check(pointer(_Safe(s1)^.Values) = pointer(_Safe(s2)^.Values),
     'generated once');
+  // GenerateSchema() returns a copy of the cached schema
+  s2 := TMcpSchemaGenerator.GenerateSchema(TypeInfo(TSchemaCached));
+  Check(pointer(_Safe(s1)^.Values) <> pointer(_Safe(s2)^.Values), 'a copy');
+  CheckEqual(VariantSaveJson(s2), BEFORE);
   // any metadata change regenerates the schemas
   McpSchema(TypeInfo(TSchemaCached)).Field('Value').Keyword('minimum', 0);
-  s2 := TMcpSchemaGenerator.GenerateSchema(TypeInfo(TSchemaCached));
+  s2 := McpSchema(TypeInfo(TSchemaCached)).Schema;
   Check(pointer(_Safe(s1)^.Values) <> pointer(_Safe(s2)^.Values),
     'generated again');
   CheckEqual(VariantSaveJson(s1), BEFORE);
@@ -458,6 +523,96 @@ begin
   finally
     server.Free;
   end;
+end;
+
+procedure TTestMcpSchema.DefsHoisted;
+const
+  ORDER =
+    '{"type":"object","properties":{"Billing":{"$ref":"#/$defs/Place"},' +
+    '"Shipping":{"$ref":"#/$defs/Place",' +
+    '"description":"Defaults to the billing address"}},"required":["Billing"]}';
+var
+  raised: boolean;
+begin
+  RegisterMetadata;
+  // a "$defs" keyword and a generated "$defs" make one "$defs" member
+  McpSchema(TypeInfo(TSchemaForest))
+    .Keyword('$defs', _ObjFast(['Place', McpSchema(TypeInfo(TSchemaPlace)).Schema]))
+    .Field('Billing').Replace('{"$ref":"#/$defs/Place"}');
+  CheckSchema(TypeInfo(TSchemaForest),
+    '{"type":"object","properties":{"Tree":{"type":"object",' +
+    SCHEMA_NODE_PROPS + '},"Billing":{"$ref":"#/$defs/Place"}},' +
+    '"required":["Tree","Billing"],"$defs":{"Place":' + SCHEMA_PLACE +
+    ',"TSchemaNode":{"type":"object",' + SCHEMA_NODE_PROPS + '}}}');
+  // the "$defs" of a nested type go to the root, where "$ref" finds them
+  McpSchema(TypeInfo(TSchemaOrder))
+    .Keyword('$defs', _ObjFast(['Place', McpSchema(TypeInfo(TSchemaPlace)).Schema]))
+    .Field('Billing').Replace('{"$ref":"#/$defs/Place"}')
+    .Field('Shipping').Replace('{"$ref":"#/$defs/Place"}')
+      .Description('Defaults to the billing address').Optional;
+  CheckSchema(TypeInfo(TSchemaCheckout),
+    '{"type":"object","properties":{"Order":' + ORDER + '},' +
+    '"required":["Order"],"$defs":{"Place":' + SCHEMA_PLACE + '}}');
+  // the same name with another content is an error
+  McpSchema(TypeInfo(TSchemaConflict))
+    .Keyword('$defs', _JsonFast('{"Place":{"type":"string"}}'));
+  raised := false;
+  try
+    TMcpSchemaGenerator.GenerateSchema(TypeInfo(TSchemaConflict));
+  except
+    on EMcpException do
+      raised := true;
+  end;
+  Check(raised, '$defs conflict');
+  raised := false;
+  try
+    McpSchema(TypeInfo(TSchemaConflict)).Keyword('default', 1);
+  except
+    on EMcpException do
+      raised := true;
+  end;
+  Check(raised, 'a default value belongs to a field');
+end;
+
+procedure TTestMcpSchema.ReplaceParsing;
+var
+  schema: variant;
+  ratio: PDocVariantData;
+  raised: boolean;
+begin
+  RegisterTypes;
+  McpSchema(TypeInfo(TSchemaBounds))
+    .Field('Ratio').Replace('{"type":"number","minimum":0.000001}');
+  schema := TMcpSchemaGenerator.GenerateSchema(TypeInfo(TSchemaBounds));
+  ratio := _Safe(schema)^.O['properties']^.O['Ratio'];
+  Check(TVarData(ratio^.Value['minimum']).VType = varDouble, 'not a string');
+  CheckSame(ratio^.D['minimum'], 0.000001);
+  raised := false;
+  try
+    McpSchema(TypeInfo(TSchemaBounds)).Replace('null');
+  except
+    on EMcpException do
+      raised := true;
+  end;
+  Check(raised, 'null is not an object');
+end;
+
+procedure TTestMcpSchema.SchemaCopies;
+var
+  tool1, tool2: IMcpTool;
+  schema: variant;
+begin
+  RegisterMetadata;
+  tool1 := TSchemaSearchTool.Create('search1', 'Search');
+  tool2 := TSchemaSearchTool.Create('search2', 'Search');
+  schema := tool1.GetInputSchema;
+  _Safe(schema)^.AddOrUpdateValue('description', 'changed');
+  CheckEqual(VariantSaveJson(tool2.GetInputSchema), SCHEMA_SEARCH);
+  schema := TMcpSchemaGenerator.GenerateSchema(TypeInfo(TSchemaSearch));
+  _Safe(schema)^.AddOrUpdateValue('description', 'changed');
+  CheckEqual(VariantSaveJson(tool1.GetInputSchema), SCHEMA_SEARCH);
+  CheckEqual(VariantSaveJson(McpSchema(TypeInfo(TSchemaSearch)).Schema),
+    SCHEMA_SEARCH);
 end;
 
 end.
