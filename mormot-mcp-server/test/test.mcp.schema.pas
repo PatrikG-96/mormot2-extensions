@@ -163,6 +163,7 @@ type
     procedure DefsHoisted;
     procedure ReplaceParsing;
     procedure SchemaCopies;
+    procedure DefaultsInArraysAndRecords;
   end;
 
 const
@@ -613,6 +614,45 @@ begin
   CheckEqual(VariantSaveJson(tool1.GetInputSchema), SCHEMA_SEARCH);
   CheckEqual(VariantSaveJson(McpSchema(TypeInfo(TSchemaSearch)).Schema),
     SCHEMA_SEARCH);
+end;
+
+procedure TTestMcpSchema.DefaultsInArraysAndRecords;
+var
+  server: TMcpServer;
+
+  procedure CheckCall(const aArgs, aExpected: RawUtf8);
+  var
+    response: TDocVariantData;
+  begin
+    if CheckFailed(response.InitJson(server.ExecuteRequest(
+         '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":' +
+         '{"name":"route","arguments":' + aArgs + '}}'), JSON_FAST), aArgs) then
+      exit;
+    CheckEqual(response.O['result']^.A['content']^._[0]^.U['text'],
+      aExpected, aArgs);
+  end;
+
+begin
+  RegisterMetadata;
+  McpSchema(TypeInfo(TSchemaRoute))
+    .Field('Start').DefaultValue(_JsonFast('{"Street":"Main","City":"Rome"}'));
+  server := TMcpServer.Create('TestServer', '1.0');
+  try
+    server.RegisterTool(TSchemaRouteTool.Create('route', 'Route'));
+    server.Start;
+    // the defaults of a record apply to the items of arrays, and a supplied
+    // record only gets the defaults of its own fields
+    CheckCall('{"Stops":[{"Street":"a"},{"Street":"b","City":"Lyon"}],' +
+      '"Legs":[{"Street":"x"},{"Street":"y"}],"Start":{"Street":"Oak"}}',
+      '{"Stops":[{"Street":"a","City":"Paris"},{"Street":"b","City":"Lyon"}],' +
+      '"Legs":[{"Street":"x","City":"Paris"},{"Street":"y","City":"Paris"}],' +
+      '"Start":{"Street":"Oak","City":"Paris"}}');
+    // a missing record field gets its own default value
+    CheckCall('{}', '{"Stops":[],"Legs":[{"Street":"","City":""},' +
+      '{"Street":"","City":""}],"Start":{"Street":"Main","City":"Rome"}}');
+  finally
+    server.Free;
+  end;
 end;
 
 end.

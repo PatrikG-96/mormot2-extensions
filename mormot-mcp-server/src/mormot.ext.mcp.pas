@@ -170,6 +170,23 @@ type
 { ************ RTTI-based Schema Generation }
 
 type
+  /// how TMcpSchemaType adds a default value to the tool arguments
+  // - internal type: see TMcpSchemaType.ArgumentsJson
+  TMcpSchemaDefault = record
+    /// the field name
+    Name: RawUtf8;
+    /// the DefaultValue() of this field, used when it is missing
+    Value: variant;
+    /// if Value is set
+    HasValue: boolean;
+    /// if Node applies to the items of this array field
+    Items: boolean;
+    /// the index of the defaults of the nested record type, or -1
+    Node: integer;
+  end;
+  /// the defaults of a record type (index 0) and of the record types it uses
+  TMcpSchemaDefaults = array of array of TMcpSchemaDefault;
+
   /// JSON Schema metadata, common to TMcpSchemaType and TMcpSchemaField
   // - the "$defs" keywords of all types and fields, and the "$defs" of their
   // Replace() schemas, are moved to the root of the generated schema, where
@@ -207,6 +224,8 @@ type
     /// set the "default" value of this field, and make it optional
     // - the value is in its JSON form, e.g. an enumeration name
     // - same as Keyword('default', aValue)
+    // - TMcpToolBase<T> adds it to the arguments when this field is missing,
+    // also in nested records and in the record items of arrays
     function DefaultValue(const aValue: variant): TMcpSchemaField;
     /// make this field optional, i.e. not listed in "required"
     // - by default, a field is required unless it has a default value
@@ -249,7 +268,7 @@ type
     fRtti: TRttiCustom;
     fFields: array of TMcpSchemaField;
     fSchema: variant;
-    fDefaults: RawUtf8;
+    fDefaults: TMcpSchemaDefaults;
     fVersion: integer;
     // caller should have locked SchemaSafe
     procedure Prepare;
@@ -287,11 +306,13 @@ type
     // modifying it (TMcpSchemaGenerator.GenerateSchema returns a copy)
     // - raise EMcpException if two "$defs" have the same name but differ
     function Schema: variant;
-    /// reset a record of this type, then set the DefaultValue() of its
-    // fields, including the fields of its nested records
-    // - TMcpToolBase<T> calls it before reading the tool arguments, so that
-    // a missing argument gets its published default value, or zero
-    procedure ClearWithDefaults(var aRecord);
+    /// return the JSON of the aArgs object, with the DefaultValue() of its
+    // missing fields added
+    // - also for the fields of nested records and of the record items of
+    // arrays which aArgs contains; a field present in aArgs is kept as is
+    // - returns '{}' (with the defaults) if aArgs is not a JSON object
+    // - TMcpToolBase<T> loads the tool arguments from it
+    function ArgumentsJson(const aArgs: variant): RawUtf8;
     /// the RTTI of this type
     property Rtti: TRttiCustom
       read fRtti;
@@ -990,59 +1011,210 @@ begin
     aSchema.AddValue('$defs', variant(Defs));
 end;
 
-// add the DefaultValue() of the fields of aRtti, and of its nested records
-procedure AddDefaults(aRtti: TRttiCustom; var aDefaults: TDocVariantData);
+{ default values }
+
+// build the defaults of aRtti (node 0) and of the record types it uses
+// - aTypes[n] is the type of node n
+procedure BuildDefaults(aRtti: TRttiCustom; out aDefaults: TMcpSchemaDefaults;
+  out aTypes: TPointerDynArray);
 var
+  used: TBooleanDynArray;  // if a node has some default value, maybe nested
+  entries: array of TMcpSchemaDefault;
+  e: TMcpSchemaDefault;
+  pe: ^TMcpSchemaDefault;
+  rc, item: TRttiCustom;
   meta: TMcpSchemaType;
   field: TMcpSchemaField;
-  nested: TDocVariantData;
   value: PVariant;
   p: PRttiCustomProp;
-  i: PtrInt;
+  n, i, j, count: PtrInt;
+  changed: boolean;
 begin
-  meta := aRtti.GetPrivateSlot(TMcpSchemaType);
-  p := pointer(aRtti.Props.List);
-  for i := 1 to aRtti.Props.Count do
+  PtrArrayAdd(aTypes, aRtti);
+  n := 0;
+  while n < length(aTypes) do // aTypes may grow during the loop
   begin
-    if p^.Name <> '' then
+    rc := aTypes[n];
+    meta := rc.GetPrivateSlot(TMcpSchemaType);
+    entries := nil;
+    p := pointer(rc.Props.List);
+    for i := 1 to rc.Props.Count do
     begin
-      field := nil;
-      if meta <> nil then
-        field := meta.GetField(p^.Name);
-      if (field <> nil) and
-         field.fKeywords.GetAsPVariant('default', value) then
-        aDefaults.AddValue(p^.Name, value^)
-      else if p^.Value.Parser = ptRecord then
+      if p^.Name <> '' then
       begin
-        nested.InitFast(dvObject);
-        AddDefaults(p^.Value, nested);
-        if nested.Count <> 0 then
-          aDefaults.AddValue(p^.Name, variant(nested));
-        nested.Clear;
+        e.Name := p^.Name;
+        field := nil;
+        if meta <> nil then
+          field := meta.GetField(p^.Name);
+        e.HasValue := (field <> nil) and
+                      field.fKeywords.GetAsPVariant('default', value);
+        if e.HasValue then
+          e.Value := value^
+        else
+          VarClear(e.Value);
+        e.Items := false;
+        e.Node := -1;
+        item := p^.Value;
+        if (item.Parser in [ptArray, ptDynArray]) and
+           (item.ArrayRtti <> nil) then
+        begin
+          e.Items := true;
+          item := item.ArrayRtti;
+        end;
+        if item.Kind in rkRecordTypes then
+          e.Node := PtrArrayAddOnce(aTypes, item);
+        if e.HasValue or
+           (e.Node >= 0) then
+        begin
+          SetLength(entries, length(entries) + 1);
+          entries[high(entries)] := e;
+        end;
+      end;
+      inc(p);
+    end;
+    SetLength(aDefaults, length(aTypes));
+    aDefaults[n] := entries;
+    inc(n);
+  end;
+  // keep only the nested records which have some default value
+  SetLength(used, length(aTypes));
+  repeat
+    changed := false;
+    for n := 0 to high(aDefaults) do
+      if not used[n] then
+        for i := 0 to high(aDefaults[n]) do
+        begin
+          pe := @aDefaults[n][i];
+          if pe^.HasValue or
+             ((pe^.Node >= 0) and used[pe^.Node]) then
+          begin
+            used[n] := true;
+            changed := true;
+            break;
+          end;
+        end;
+  until not changed;
+  if not used[0] then
+  begin
+    aDefaults := nil; // nothing to add to the arguments
+    exit;
+  end;
+  for n := 0 to high(aDefaults) do
+  begin
+    count := 0;
+    for i := 0 to high(aDefaults[n]) do
+    begin
+      e := aDefaults[n][i];
+      if (e.Node >= 0) and
+         not used[e.Node] then
+        e.Node := -1;
+      if e.HasValue or
+         (e.Node >= 0) then
+      begin
+        aDefaults[n][count] := e;
+        inc(count);
       end;
     end;
-    inc(p);
+    SetLength(aDefaults[n], count);
   end;
+  for j := 0 to high(aDefaults) do
+    if not used[j] then
+      aDefaults[j] := nil;
+end;
+
+// add the missing default values of node aNode to aArgs
+procedure AddDefaults(const aDefaults: TMcpSchemaDefaults; aNode: PtrInt;
+  var aArgs: TDocVariantData);
+var
+  i, j, ndx: PtrInt;
+  e: ^TMcpSchemaDefault;
+  nested: TDocVariantData;
+  value: PDocVariantData;
+begin
+  for i := 0 to high(aDefaults[aNode]) do
+  begin
+    e := @aDefaults[aNode][i];
+    ndx := aArgs.GetValueIndex(e^.Name);
+    if ndx < 0 then
+    begin
+      if e^.HasValue then
+        aArgs.AddValue(e^.Name, e^.Value)
+      else if not e^.Items then
+      begin
+        // a missing record: the default values of its own fields
+        nested.InitFast(dvObject);
+        AddDefaults(aDefaults, e^.Node, nested);
+        if nested.Count <> 0 then
+          aArgs.AddValue(e^.Name, variant(nested));
+        nested.Clear;
+      end;
+    end
+    else if e^.Node >= 0 then
+    begin
+      // a supplied record, or array of records: complete each of them
+      value := _Safe(aArgs.Values[ndx]);
+      if e^.Items then
+      begin
+        if value^.IsArray then
+          for j := 0 to value^.Count - 1 do
+            if _Safe(value^.Values[j])^.IsObject then
+              AddDefaults(aDefaults, e^.Node, _Safe(value^.Values[j])^);
+      end
+      else if value^.IsObject then
+        AddDefaults(aDefaults, e^.Node, value^);
+    end;
+  end;
+end;
+
+// log the default values which can't be read into their record, once
+procedure CheckDefaults(const aDefaults: TMcpSchemaDefaults;
+  const aTypes: TPointerDynArray);
+var
+  n: PtrInt;
+  rc: TRttiCustom;
+  doc: TDocVariantData;
+  json: RawUtf8;
+  tmp: pointer;
+  ok: boolean;
+begin
+  for n := 0 to high(aDefaults) do
+    if aDefaults[n] <> nil then
+    begin
+      rc := aTypes[n];
+      doc.InitFast(dvObject);
+      AddDefaults(aDefaults, n, doc);
+      json := doc.ToJson;
+      doc.Clear;
+      tmp := AllocMem(rc.Size);
+      try
+        ok := RecordLoadJson(tmp^, json, rc.Info, nil, {tolerant=}false);
+      finally
+        rc.ValueFinalize(tmp);
+        FreeMem(tmp);
+      end;
+      if not ok then
+        TSynLog.Add.Log(sllWarning, 'McpSchema(%): the default values % ' +
+          'can''t be read', [rc.Name, json]);
+    end;
 end;
 
 procedure TMcpSchemaType.Prepare;
 var
   w: TSchemaWriter;
   schema: variant;
-  defaults: TDocVariantData;
+  types: TPointerDynArray;
 begin
   if not VarIsEmptyOrNull(fSchema) and
      (fVersion = SchemaVersion) then
     exit;
   w.WriteRoot(fRtti, TDocVariantData(schema)); // may raise EMcpException
   fSchema := schema;
-  defaults.InitFast(dvObject);
+  fDefaults := nil;
   if fRtti.Kind in rkRecordTypes then
-    AddDefaults(fRtti, defaults);
-  if defaults.Count = 0 then
-    fDefaults := ''
-  else
-    fDefaults := defaults.ToJson;
+  begin
+    BuildDefaults(fRtti, fDefaults, types);
+    CheckDefaults(fDefaults, types);
+  end;
   fVersion := SchemaVersion;
 end;
 
@@ -1057,23 +1229,34 @@ begin
   end;
 end;
 
-procedure TMcpSchemaType.ClearWithDefaults(var aRecord);
+function TMcpSchemaType.ArgumentsJson(const aArgs: variant): RawUtf8;
 var
-  defaults: RawUtf8;
+  defaults: TMcpSchemaDefaults;
+  args: TDocVariantData;
+  src: PDocVariantData;
 begin
-  if not (fRtti.Kind in rkRecordTypes) then
-    raise EMcpException.CreateUtf8('McpSchema(%).ClearWithDefaults: ' +
-      'not a record', [fRtti.Name]);
-  fRtti.ValueFinalizeAndClear(@aRecord);
   SchemaSafe.Lock;
   try
     Prepare;
-    defaults := fDefaults;
+    defaults := fDefaults; // by reference: a new Prepare won't change it
   finally
     SchemaSafe.UnLock;
   end;
-  if defaults <> '' then
-    RecordLoadJson(aRecord, defaults, fRtti.Info);
+  src := _Safe(aArgs);
+  if defaults = nil then
+    if src^.IsObject then
+      result := src^.ToJson
+    else
+      result := '{}'
+  else
+  begin
+    if src^.IsObject then
+      args.InitCopy(aArgs, JSON_FAST) // never modify the request
+    else
+      args.InitFast(dvObject);
+    AddDefaults(defaults, 0, args);
+    result := args.ToJson;
+  end;
 end;
 
 class function TMcpSchemaGenerator.GenerateSchema(aTypeInfo: PRttiInfo): variant;
@@ -1297,17 +1480,12 @@ function TMcpToolBase<T>.Execute(const aArgs: variant;
   const aAuthCtx: TMcpAuthContext): variant;
 var
   params: T;
-  doc: PDocVariantData;
-  json: RawUtf8;
 begin
-  // Deserialize arguments into typed record, over the default values
-  if _Safe(aArgs, doc) then
-    json := doc^.ToJson
-  else
-    json := '{}';
-  fSchema.ClearWithDefaults(params);
-  RecordLoadJson(params, json, TypeInfo(T));
-  
+  // Deserialize arguments into typed record, with the missing default values
+  // - a missing field without default value is zero
+  fSchema.Rtti.ValueFinalizeAndClear(@params);
+  RecordLoadJson(params, fSchema.ArgumentsJson(aArgs), TypeInfo(T));
+
   // Execute typed implementation
   result := ExecuteTyped(params, aAuthCtx);
 end;
