@@ -8,6 +8,20 @@ Pure mORMot v2 implementation of the Model Context Protocol (MCP) with JSON‑RP
 ### Next step
 - Integrate the MCP server into your favorite tool - see [preview](#preview)
 
+## Units
+- `mormot.ext.mcp`: the MCP server (`TMcpServer`), its tool and resource
+  registry, and the `TMcpToolBase<T>` and `TMcpResourceBase` base classes.
+  It also declares aliases for the public types, constants and functions of
+  the next three units, so `uses mormot.ext.mcp` is enough for most code.
+- `mormot.ext.mcp.jsonrpc`: JSON-RPC 2.0 message parsing, error codes and
+  `EMcpException`.
+- `mormot.ext.mcp.schema`: the tool parameter schema generator and its
+  `McpSchema()` metadata.
+- `mormot.ext.mcp.content`: content blocks (`TMcpResponseBuilder`), icons and
+  annotations.
+- `mormot.ext.mcp.server` (HTTP, SSE and Streamable HTTP transports) and
+  `mormot.ext.mcp.stdio` (stdio transport).
+
 ## Demos (each is a separate program)
 - `demo.mcp.jsonrpc`  
   In‑process JSON‑RPC demo (no network).
