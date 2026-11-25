@@ -22,6 +22,11 @@ Pure mORMot v2 implementation of the Model Context Protocol (MCP) with JSON‑RP
 - `mormot.ext.mcp.server` (HTTP, SSE and Streamable HTTP transports) and
   `mormot.ext.mcp.stdio` (stdio transport).
 
+Moved classes keep source compatibility through the aliases, but their RTTI
+qualified names change (for example `TMcpJsonRpcProcessor.QualifiedClassName` is
+now `mormot.ext.mcp.jsonrpc.TMcpJsonRpcProcessor`), so any persisted key that
+uses the old name must be migrated.
+
 ## Demos (each is a separate program)
 - `demo.mcp.jsonrpc`  
   In‑process JSON‑RPC demo (no network).
